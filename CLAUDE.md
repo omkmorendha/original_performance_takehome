@@ -137,3 +137,27 @@ The memory image contains:
 - Use `prints=True` in `do_kernel_test()` to see scratch space state
 - The `pause` instruction synchronizes with reference kernel yields for step-by-step validation
 - Check `scratch_map` in debug info to see variable names and addresses
+
+## Optimization Tracking
+
+All optimization iterations are documented in the `optimizations/` directory:
+
+- **`optimizations/README.md`**: Index of all iterations with performance metrics
+- **`optimizations/XXX_name.md`**: Individual iteration documentation
+- **`optimizations/TEMPLATE.md`**: Template for new iterations
+
+### Workflow for New Optimizations
+
+1. Copy `TEMPLATE.md` to `XXX_description.md` (use next number in sequence)
+2. Document your hypothesis and approach
+3. Implement changes in `perf_takehome.py`
+4. Run tests and record results
+5. Update the iteration file with findings
+6. Update `README.md` index table
+7. Commit with descriptive message
+
+### Current Status
+
+- **Baseline:** 147734 cycles
+- **Target:** < 1487 cycles (99% speedup needed)
+- **Best:** Check `optimizations/README.md` for current best result
