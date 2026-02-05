@@ -106,8 +106,9 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
         """
-        Optimized SIMD implementation processing 16 elements at a time (2 groups of 8).
-        Uses VLIW packing to maximize parallelism across engines.
+        Optimized SIMD implementation with software pipelining.
+        Processes 16 elements at a time (2 groups of 8).
+        Overlaps memory loads with computation using double buffering.
         """
         self.vconst_inits = []
 
@@ -129,30 +130,42 @@ class KernelBuilder:
         one_const = self.scratch_const(1)
         two_const = self.scratch_const(2)
 
-        # Vector registers for two groups (A and B)
-        v_idx_a = self.alloc_scratch("v_idx_a", VLEN)
-        v_val_a = self.alloc_scratch("v_val_a", VLEN)
-        v_node_val_a = self.alloc_scratch("v_node_val_a", VLEN)
-        v_tmp1_a = self.alloc_scratch("v_tmp1_a", VLEN)
-        v_tmp2_a = self.alloc_scratch("v_tmp2_a", VLEN)
-        v_tmp3_a = self.alloc_scratch("v_tmp3_a", VLEN)
-        v_cond_a = self.alloc_scratch("v_cond_a", VLEN)
+        # Double buffering: two sets of vector registers (0 and 1)
+        # Each set handles 2 groups (A and B) = 16 elements
+        v_idx = [
+            [self.alloc_scratch(f"v_idx_{s}a", VLEN), self.alloc_scratch(f"v_idx_{s}b", VLEN)]
+            for s in range(2)
+        ]
+        v_val = [
+            [self.alloc_scratch(f"v_val_{s}a", VLEN), self.alloc_scratch(f"v_val_{s}b", VLEN)]
+            for s in range(2)
+        ]
+        v_node_val = [
+            [self.alloc_scratch(f"v_node_{s}a", VLEN), self.alloc_scratch(f"v_node_{s}b", VLEN)]
+            for s in range(2)
+        ]
+        v_tmp1 = [
+            [self.alloc_scratch(f"v_tmp1_{s}a", VLEN), self.alloc_scratch(f"v_tmp1_{s}b", VLEN)]
+            for s in range(2)
+        ]
+        v_tmp2 = [
+            [self.alloc_scratch(f"v_tmp2_{s}a", VLEN), self.alloc_scratch(f"v_tmp2_{s}b", VLEN)]
+            for s in range(2)
+        ]
+        v_tmp3 = [
+            [self.alloc_scratch(f"v_tmp3_{s}a", VLEN), self.alloc_scratch(f"v_tmp3_{s}b", VLEN)]
+            for s in range(2)
+        ]
+        v_cond = [
+            [self.alloc_scratch(f"v_cond_{s}a", VLEN), self.alloc_scratch(f"v_cond_{s}b", VLEN)]
+            for s in range(2)
+        ]
 
-        v_idx_b = self.alloc_scratch("v_idx_b", VLEN)
-        v_val_b = self.alloc_scratch("v_val_b", VLEN)
-        v_node_val_b = self.alloc_scratch("v_node_val_b", VLEN)
-        v_tmp1_b = self.alloc_scratch("v_tmp1_b", VLEN)
-        v_tmp2_b = self.alloc_scratch("v_tmp2_b", VLEN)
-        v_tmp3_b = self.alloc_scratch("v_tmp3_b", VLEN)
-        v_cond_b = self.alloc_scratch("v_cond_b", VLEN)
+        # Scalar addresses for each buffer
+        idx_addr = [[self.alloc_scratch(f"idx_addr_{s}a"), self.alloc_scratch(f"idx_addr_{s}b")] for s in range(2)]
+        val_addr = [[self.alloc_scratch(f"val_addr_{s}a"), self.alloc_scratch(f"val_addr_{s}b")] for s in range(2)]
 
-        # Scalar addresses
-        idx_addr_a = self.alloc_scratch("idx_addr_a")
-        val_addr_a = self.alloc_scratch("val_addr_a")
-        idx_addr_b = self.alloc_scratch("idx_addr_b")
-        val_addr_b = self.alloc_scratch("val_addr_b")
-
-        # Node addresses for scattered loads
+        # Node addresses for scattered loads (one set, reused)
         node_addrs_a = [self.alloc_scratch(f"node_addr_a{i}") for i in range(VLEN)]
         node_addrs_b = [self.alloc_scratch(f"node_addr_b{i}") for i in range(VLEN)]
 
@@ -171,121 +184,342 @@ class KernelBuilder:
         self.instrs.append({"valu": [("vbroadcast", v_n_nodes, self.scratch["n_nodes"])]})
 
         self.add("flow", ("pause",))
-        self.add("debug", ("comment", "Starting SIMD loop"))
+        self.add("debug", ("comment", "Starting pipelined SIMD loop"))
 
         n_groups = batch_size // VLEN  # 32 groups of 8
+        n_iters = n_groups // 2  # 16 dual-group iterations per round
 
-        for round_idx in range(rounds):
-            for group in range(0, n_groups, 2):
-                offset_a = group * VLEN
-                offset_b = (group + 1) * VLEN
-                offset_const_a = self.scratch_const(offset_a)
-                offset_const_b = self.scratch_const(offset_b)
+        def emit_load_phase(s, offset_a, offset_b):
+            """Emit load instructions for buffer s."""
+            offset_const_a = self.scratch_const(offset_a)
+            offset_const_b = self.scratch_const(offset_b)
 
-                # === LOAD PHASE ===
-                # Calculate all 4 addresses
-                self.instrs.append({"alu": [
-                    ("+", idx_addr_a, self.scratch["inp_indices_p"], offset_const_a),
-                    ("+", val_addr_a, self.scratch["inp_values_p"], offset_const_a),
-                    ("+", idx_addr_b, self.scratch["inp_indices_p"], offset_const_b),
-                    ("+", val_addr_b, self.scratch["inp_values_p"], offset_const_b),
-                ]})
+            # Calculate addresses
+            self.instrs.append({"alu": [
+                ("+", idx_addr[s][0], self.scratch["inp_indices_p"], offset_const_a),
+                ("+", val_addr[s][0], self.scratch["inp_values_p"], offset_const_a),
+                ("+", idx_addr[s][1], self.scratch["inp_indices_p"], offset_const_b),
+                ("+", val_addr[s][1], self.scratch["inp_values_p"], offset_const_b),
+            ]})
 
-                # Load indices and values for both groups
+            # Load indices and values
+            self.instrs.append({"load": [
+                ("vload", v_idx[s][0], idx_addr[s][0]),
+                ("vload", v_val[s][0], val_addr[s][0]),
+            ]})
+            self.instrs.append({"load": [
+                ("vload", v_idx[s][1], idx_addr[s][1]),
+                ("vload", v_val[s][1], val_addr[s][1]),
+            ]})
+
+            # Compute node addresses
+            self.instrs.append({"alu": [
+                ("+", node_addrs_a[i], self.scratch["forest_values_p"], v_idx[s][0] + i)
+                for i in range(VLEN)
+            ] + [
+                ("+", node_addrs_b[i], self.scratch["forest_values_p"], v_idx[s][1] + i)
+                for i in range(4)
+            ]})
+            self.instrs.append({"alu": [
+                ("+", node_addrs_b[i], self.scratch["forest_values_p"], v_idx[s][1] + i)
+                for i in range(4, VLEN)
+            ]})
+
+            # Load node values
+            for i in range(0, VLEN, 2):
                 self.instrs.append({"load": [
-                    ("vload", v_idx_a, idx_addr_a),
-                    ("vload", v_val_a, val_addr_a),
+                    ("load", v_node_val[s][0] + i, node_addrs_a[i]),
+                    ("load", v_node_val[s][0] + i + 1, node_addrs_a[i + 1]),
                 ]})
+            for i in range(0, VLEN, 2):
                 self.instrs.append({"load": [
-                    ("vload", v_idx_b, idx_addr_b),
-                    ("vload", v_val_b, val_addr_b),
+                    ("load", v_node_val[s][1] + i, node_addrs_b[i]),
+                    ("load", v_node_val[s][1] + i + 1, node_addrs_b[i + 1]),
                 ]})
 
-                # Compute all 16 node addresses (12 per cycle max)
-                self.instrs.append({"alu": [
-                    ("+", node_addrs_a[i], self.scratch["forest_values_p"], v_idx_a + i)
+        def emit_compute_phase(s):
+            """Emit compute instructions for buffer s."""
+            va, vb = 0, 1  # indices into the group arrays
+
+            # XOR
+            self.instrs.append({"valu": [
+                ("^", v_val[s][va], v_val[s][va], v_node_val[s][va]),
+                ("^", v_val[s][vb], v_val[s][vb], v_node_val[s][vb]),
+            ]})
+
+            # Hash: 6 stages
+            for hi in range(6):
+                op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                vc1 = self.hash_vconsts[(hi, 1)]
+                vc3 = self.hash_vconsts[(hi, 3)]
+                self.instrs.append({"valu": [
+                    (op1, v_tmp1[s][va], v_val[s][va], vc1),
+                    (op3, v_tmp2[s][va], v_val[s][va], vc3),
+                    (op1, v_tmp1[s][vb], v_val[s][vb], vc1),
+                    (op3, v_tmp2[s][vb], v_val[s][vb], vc3),
+                ]})
+                self.instrs.append({"valu": [
+                    (op2, v_val[s][va], v_tmp1[s][va], v_tmp2[s][va]),
+                    (op2, v_val[s][vb], v_tmp1[s][vb], v_tmp2[s][vb]),
+                ]})
+
+            # Index calculation
+            self.instrs.append({"valu": [
+                ("%", v_tmp1[s][va], v_val[s][va], v_two),
+                ("*", v_idx[s][va], v_idx[s][va], v_two),
+                ("%", v_tmp1[s][vb], v_val[s][vb], v_two),
+                ("*", v_idx[s][vb], v_idx[s][vb], v_two),
+            ]})
+            self.instrs.append({"valu": [
+                ("==", v_cond[s][va], v_tmp1[s][va], v_zero),
+                ("==", v_cond[s][vb], v_tmp1[s][vb], v_zero),
+            ]})
+            self.instrs.append({"flow": [("vselect", v_tmp3[s][va], v_cond[s][va], v_one, v_two)]})
+            self.instrs.append({"flow": [("vselect", v_tmp3[s][vb], v_cond[s][vb], v_one, v_two)]})
+            self.instrs.append({"valu": [
+                ("+", v_idx[s][va], v_idx[s][va], v_tmp3[s][va]),
+                ("+", v_idx[s][vb], v_idx[s][vb], v_tmp3[s][vb]),
+            ]})
+
+            # Wrap indices
+            self.instrs.append({"valu": [
+                ("<", v_cond[s][va], v_idx[s][va], v_n_nodes),
+                ("<", v_cond[s][vb], v_idx[s][vb], v_n_nodes),
+            ]})
+            self.instrs.append({"flow": [("vselect", v_idx[s][va], v_cond[s][va], v_idx[s][va], v_zero)]})
+            self.instrs.append({"flow": [("vselect", v_idx[s][vb], v_cond[s][vb], v_idx[s][vb], v_zero)]})
+
+            # Store
+            self.instrs.append({"store": [
+                ("vstore", idx_addr[s][va], v_idx[s][va]),
+                ("vstore", val_addr[s][va], v_val[s][va]),
+            ]})
+            self.instrs.append({"store": [
+                ("vstore", idx_addr[s][vb], v_idx[s][vb]),
+                ("vstore", val_addr[s][vb], v_val[s][vb]),
+            ]})
+
+        def emit_pipelined_compute_with_load(compute_s, load_s, load_offset_a, load_offset_b):
+            """Emit compute for buffer compute_s while loading into buffer load_s."""
+            va, vb = 0, 1
+            load_offset_const_a = self.scratch_const(load_offset_a)
+            load_offset_const_b = self.scratch_const(load_offset_b)
+
+            # XOR + calculate load addresses
+            self.instrs.append({
+                "valu": [
+                    ("^", v_val[compute_s][va], v_val[compute_s][va], v_node_val[compute_s][va]),
+                    ("^", v_val[compute_s][vb], v_val[compute_s][vb], v_node_val[compute_s][vb]),
+                ],
+                "alu": [
+                    ("+", idx_addr[load_s][0], self.scratch["inp_indices_p"], load_offset_const_a),
+                    ("+", val_addr[load_s][0], self.scratch["inp_values_p"], load_offset_const_a),
+                    ("+", idx_addr[load_s][1], self.scratch["inp_indices_p"], load_offset_const_b),
+                    ("+", val_addr[load_s][1], self.scratch["inp_values_p"], load_offset_const_b),
+                ],
+            })
+
+            # Hash stage 0 + vload indices/values for load buffer
+            hi = 0
+            op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+            vc1 = self.hash_vconsts[(hi, 1)]
+            vc3 = self.hash_vconsts[(hi, 3)]
+            self.instrs.append({
+                "valu": [
+                    (op1, v_tmp1[compute_s][va], v_val[compute_s][va], vc1),
+                    (op3, v_tmp2[compute_s][va], v_val[compute_s][va], vc3),
+                    (op1, v_tmp1[compute_s][vb], v_val[compute_s][vb], vc1),
+                    (op3, v_tmp2[compute_s][vb], v_val[compute_s][vb], vc3),
+                ],
+                "load": [
+                    ("vload", v_idx[load_s][0], idx_addr[load_s][0]),
+                    ("vload", v_val[load_s][0], val_addr[load_s][0]),
+                ],
+            })
+            self.instrs.append({
+                "valu": [
+                    (op2, v_val[compute_s][va], v_tmp1[compute_s][va], v_tmp2[compute_s][va]),
+                    (op2, v_val[compute_s][vb], v_tmp1[compute_s][vb], v_tmp2[compute_s][vb]),
+                ],
+                "load": [
+                    ("vload", v_idx[load_s][1], idx_addr[load_s][1]),
+                    ("vload", v_val[load_s][1], val_addr[load_s][1]),
+                ],
+            })
+
+            # Hash stage 1 + compute node addresses for load buffer
+            hi = 1
+            op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+            vc1 = self.hash_vconsts[(hi, 1)]
+            vc3 = self.hash_vconsts[(hi, 3)]
+            self.instrs.append({
+                "valu": [
+                    (op1, v_tmp1[compute_s][va], v_val[compute_s][va], vc1),
+                    (op3, v_tmp2[compute_s][va], v_val[compute_s][va], vc3),
+                    (op1, v_tmp1[compute_s][vb], v_val[compute_s][vb], vc1),
+                    (op3, v_tmp2[compute_s][vb], v_val[compute_s][vb], vc3),
+                ],
+                "alu": [
+                    ("+", node_addrs_a[i], self.scratch["forest_values_p"], v_idx[load_s][0] + i)
                     for i in range(VLEN)
                 ] + [
-                    ("+", node_addrs_b[i], self.scratch["forest_values_p"], v_idx_b + i)
+                    ("+", node_addrs_b[i], self.scratch["forest_values_p"], v_idx[load_s][1] + i)
                     for i in range(4)
-                ]})
-                self.instrs.append({"alu": [
-                    ("+", node_addrs_b[i], self.scratch["forest_values_p"], v_idx_b + i)
+                ],
+            })
+            self.instrs.append({
+                "valu": [
+                    (op2, v_val[compute_s][va], v_tmp1[compute_s][va], v_tmp2[compute_s][va]),
+                    (op2, v_val[compute_s][vb], v_tmp1[compute_s][vb], v_tmp2[compute_s][vb]),
+                ],
+                "alu": [
+                    ("+", node_addrs_b[i], self.scratch["forest_values_p"], v_idx[load_s][1] + i)
                     for i in range(4, VLEN)
-                ]})
+                ],
+            })
 
-                # Load all 16 node values (2 per cycle)
-                for i in range(0, VLEN, 2):
-                    self.instrs.append({"load": [
-                        ("load", v_node_val_a + i, node_addrs_a[i]),
-                        ("load", v_node_val_a + i + 1, node_addrs_a[i + 1]),
-                    ]})
-                for i in range(0, VLEN, 2):
-                    self.instrs.append({"load": [
-                        ("load", v_node_val_b + i, node_addrs_b[i]),
-                        ("load", v_node_val_b + i + 1, node_addrs_b[i + 1]),
-                    ]})
+            # Hash stages 2-5 + load node values
+            node_load_idx = 0
+            for hi in range(2, 6):
+                op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+                vc1 = self.hash_vconsts[(hi, 1)]
+                vc3 = self.hash_vconsts[(hi, 3)]
 
-                # === COMPUTE PHASE ===
-                # XOR both groups
-                self.instrs.append({"valu": [
-                    ("^", v_val_a, v_val_a, v_node_val_a),
-                    ("^", v_val_b, v_val_b, v_node_val_b),
-                ]})
+                # Part 1: hash ops + 2 node loads
+                load_ops = []
+                if node_load_idx < VLEN:
+                    load_ops = [
+                        ("load", v_node_val[load_s][0] + node_load_idx, node_addrs_a[node_load_idx]),
+                        ("load", v_node_val[load_s][0] + node_load_idx + 1, node_addrs_a[node_load_idx + 1]),
+                    ]
+                    node_load_idx += 2
 
-                # Hash: 6 stages, each needs 2 cycles
-                for hi in range(6):
-                    op1, val1, op2, op3, val3 = HASH_STAGES[hi]
-                    vc1 = self.hash_vconsts[(hi, 1)]
-                    vc3 = self.hash_vconsts[(hi, 3)]
-                    # Part 1: parallel ops for both groups
-                    self.instrs.append({"valu": [
-                        (op1, v_tmp1_a, v_val_a, vc1),
-                        (op3, v_tmp2_a, v_val_a, vc3),
-                        (op1, v_tmp1_b, v_val_b, vc1),
-                        (op3, v_tmp2_b, v_val_b, vc3),
-                    ]})
-                    # Part 2: combine
-                    self.instrs.append({"valu": [
-                        (op2, v_val_a, v_tmp1_a, v_tmp2_a),
-                        (op2, v_val_b, v_tmp1_b, v_tmp2_b),
-                    ]})
+                instr = {
+                    "valu": [
+                        (op1, v_tmp1[compute_s][va], v_val[compute_s][va], vc1),
+                        (op3, v_tmp2[compute_s][va], v_val[compute_s][va], vc3),
+                        (op1, v_tmp1[compute_s][vb], v_val[compute_s][vb], vc1),
+                        (op3, v_tmp2[compute_s][vb], v_val[compute_s][vb], vc3),
+                    ],
+                }
+                if load_ops:
+                    instr["load"] = load_ops
+                self.instrs.append(instr)
 
-                # idx = 2*idx + (1 if val % 2 == 0 else 2)
-                self.instrs.append({"valu": [
-                    ("%", v_tmp1_a, v_val_a, v_two),
-                    ("*", v_idx_a, v_idx_a, v_two),
-                    ("%", v_tmp1_b, v_val_b, v_two),
-                    ("*", v_idx_b, v_idx_b, v_two),
-                ]})
-                self.instrs.append({"valu": [
-                    ("==", v_cond_a, v_tmp1_a, v_zero),
-                    ("==", v_cond_b, v_tmp1_b, v_zero),
-                ]})
-                self.instrs.append({"flow": [("vselect", v_tmp3_a, v_cond_a, v_one, v_two)]})
-                self.instrs.append({"flow": [("vselect", v_tmp3_b, v_cond_b, v_one, v_two)]})
-                self.instrs.append({"valu": [
-                    ("+", v_idx_a, v_idx_a, v_tmp3_a),
-                    ("+", v_idx_b, v_idx_b, v_tmp3_b),
-                ]})
+                # Part 2: hash combine + 2 more node loads
+                load_ops = []
+                if node_load_idx < VLEN:
+                    load_ops = [
+                        ("load", v_node_val[load_s][0] + node_load_idx, node_addrs_a[node_load_idx]),
+                        ("load", v_node_val[load_s][0] + node_load_idx + 1, node_addrs_a[node_load_idx + 1]),
+                    ]
+                    node_load_idx += 2
 
-                # Wrap indices
-                self.instrs.append({"valu": [
-                    ("<", v_cond_a, v_idx_a, v_n_nodes),
-                    ("<", v_cond_b, v_idx_b, v_n_nodes),
-                ]})
-                self.instrs.append({"flow": [("vselect", v_idx_a, v_cond_a, v_idx_a, v_zero)]})
-                self.instrs.append({"flow": [("vselect", v_idx_b, v_cond_b, v_idx_b, v_zero)]})
+                instr = {
+                    "valu": [
+                        (op2, v_val[compute_s][va], v_tmp1[compute_s][va], v_tmp2[compute_s][va]),
+                        (op2, v_val[compute_s][vb], v_tmp1[compute_s][vb], v_tmp2[compute_s][vb]),
+                    ],
+                }
+                if load_ops:
+                    instr["load"] = load_ops
+                self.instrs.append(instr)
 
-                # Store results
-                self.instrs.append({"store": [
-                    ("vstore", idx_addr_a, v_idx_a),
-                    ("vstore", val_addr_a, v_val_a),
-                ]})
-                self.instrs.append({"store": [
-                    ("vstore", idx_addr_b, v_idx_b),
-                    ("vstore", val_addr_b, v_val_b),
-                ]})
+            # Continue with remaining node loads for group B during index calculation
+            node_load_idx_b = 0
+
+            # mod/mul + load node_val_b[0:2]
+            self.instrs.append({
+                "valu": [
+                    ("%", v_tmp1[compute_s][va], v_val[compute_s][va], v_two),
+                    ("*", v_idx[compute_s][va], v_idx[compute_s][va], v_two),
+                    ("%", v_tmp1[compute_s][vb], v_val[compute_s][vb], v_two),
+                    ("*", v_idx[compute_s][vb], v_idx[compute_s][vb], v_two),
+                ],
+                "load": [
+                    ("load", v_node_val[load_s][1] + 0, node_addrs_b[0]),
+                    ("load", v_node_val[load_s][1] + 1, node_addrs_b[1]),
+                ],
+            })
+
+            # equality + load node_val_b[2:4]
+            self.instrs.append({
+                "valu": [
+                    ("==", v_cond[compute_s][va], v_tmp1[compute_s][va], v_zero),
+                    ("==", v_cond[compute_s][vb], v_tmp1[compute_s][vb], v_zero),
+                ],
+                "load": [
+                    ("load", v_node_val[load_s][1] + 2, node_addrs_b[2]),
+                    ("load", v_node_val[load_s][1] + 3, node_addrs_b[3]),
+                ],
+            })
+
+            # vselect + load node_val_b[4:6]
+            self.instrs.append({
+                "flow": [("vselect", v_tmp3[compute_s][va], v_cond[compute_s][va], v_one, v_two)],
+                "load": [
+                    ("load", v_node_val[load_s][1] + 4, node_addrs_b[4]),
+                    ("load", v_node_val[load_s][1] + 5, node_addrs_b[5]),
+                ],
+            })
+
+            # vselect + load node_val_b[6:8]
+            self.instrs.append({
+                "flow": [("vselect", v_tmp3[compute_s][vb], v_cond[compute_s][vb], v_one, v_two)],
+                "load": [
+                    ("load", v_node_val[load_s][1] + 6, node_addrs_b[6]),
+                    ("load", v_node_val[load_s][1] + 7, node_addrs_b[7]),
+                ],
+            })
+
+            # add
+            self.instrs.append({"valu": [
+                ("+", v_idx[compute_s][va], v_idx[compute_s][va], v_tmp3[compute_s][va]),
+                ("+", v_idx[compute_s][vb], v_idx[compute_s][vb], v_tmp3[compute_s][vb]),
+            ]})
+
+            # compare
+            self.instrs.append({"valu": [
+                ("<", v_cond[compute_s][va], v_idx[compute_s][va], v_n_nodes),
+                ("<", v_cond[compute_s][vb], v_idx[compute_s][vb], v_n_nodes),
+            ]})
+
+            # vselect wrap
+            self.instrs.append({"flow": [("vselect", v_idx[compute_s][va], v_cond[compute_s][va], v_idx[compute_s][va], v_zero)]})
+            self.instrs.append({"flow": [("vselect", v_idx[compute_s][vb], v_cond[compute_s][vb], v_idx[compute_s][vb], v_zero)]})
+
+            # store
+            self.instrs.append({"store": [
+                ("vstore", idx_addr[compute_s][va], v_idx[compute_s][va]),
+                ("vstore", val_addr[compute_s][va], v_val[compute_s][va]),
+            ]})
+            self.instrs.append({"store": [
+                ("vstore", idx_addr[compute_s][vb], v_idx[compute_s][vb]),
+                ("vstore", val_addr[compute_s][vb], v_val[compute_s][vb]),
+            ]})
+
+        # Main pipelined loop
+        # Pipeline strategy:
+        # 1. Load iter 0 data into buffer 0
+        # 2. For each iteration i (0 to n-2):
+        #    - Compute buffer (i%2) while loading buffer ((i+1)%2) with iter i+1 data
+        # 3. Compute final buffer
+
+        for round_idx in range(rounds):
+            # Prologue: Load first iteration
+            emit_load_phase(0, 0, VLEN)
+
+            # Steady state: compute current while loading next
+            for it in range(n_iters - 1):
+                current_buf = it % 2
+                next_buf = 1 - current_buf
+                next_offset_a = (it + 1) * 2 * VLEN
+                next_offset_b = next_offset_a + VLEN
+                emit_pipelined_compute_with_load(current_buf, next_buf, next_offset_a, next_offset_b)
+
+            # Epilogue: compute last iteration (no more loads)
+            last_buf = (n_iters - 1) % 2
+            emit_compute_phase(last_buf)
 
         self.instrs.append({"flow": [("pause",)]})
 
