@@ -118,19 +118,44 @@ class KernelBuilder:
         tmp1 = self.alloc_scratch("tmp1")
         tmp2 = self.alloc_scratch("tmp2")
 
-        # Header variables
+        # Header variables - optimized loading
         init_vars = ["rounds", "n_nodes", "batch_size", "forest_height",
                      "forest_values_p", "inp_indices_p", "inp_values_p"]
         for v in init_vars:
             self.alloc_scratch(v, 1)
-        for i, v in enumerate(init_vars):
-            self.instrs.append({"load": [("const", tmp1, i)]})
-            self.instrs.append({"load": [("load", self.scratch[v], tmp1)]})
 
-        # Scalar constants
-        zero_const = self.scratch_const(0)
-        one_const = self.scratch_const(1)
-        two_const = self.scratch_const(2)
+        # Allocate temp addresses to hold memory offsets
+        tmp_addrs = [tmp1, tmp2] + [self.alloc_scratch(f"tmp_addr_{i}") for i in range(5)]
+
+        # Load const addresses in batches, then load values
+        # First, load all const addresses (2 per cycle)
+        for i in range(0, len(init_vars), 2):
+            ops = [("const", tmp_addrs[i], i)]
+            if i + 1 < len(init_vars):
+                ops.append(("const", tmp_addrs[i+1], i+1))
+            self.instrs.append({"load": ops})
+
+        # Then load all values (2 per cycle)
+        for i in range(0, len(init_vars), 2):
+            ops = [("load", self.scratch[init_vars[i]], tmp_addrs[i])]
+            if i + 1 < len(init_vars):
+                ops.append(("load", self.scratch[init_vars[i+1]], tmp_addrs[i+1]))
+            self.instrs.append({"load": ops})
+
+        # Scalar constants - load all together
+        zero_const = self.alloc_scratch("const_0")
+        one_const = self.alloc_scratch("const_1")
+        two_const = self.alloc_scratch("const_2")
+        self.instrs.append({"load": [
+            ("const", zero_const, 0),
+            ("const", one_const, 1),
+        ]})
+        self.instrs.append({"load": [
+            ("const", two_const, 2),
+        ]})
+        self.const_map[0] = zero_const
+        self.const_map[1] = one_const
+        self.const_map[2] = two_const
 
         # Double buffering: two sets of vector registers (0 and 1)
         # Each buffer has G groups
@@ -156,10 +181,11 @@ class KernelBuilder:
         # Pre-allocate hash constants
         self.init_hash_vconsts()
 
-        # Initialize vector constants
-        for vaddr, saddr in self.vconst_inits:
-            self.instrs.append({"valu": [("vbroadcast", vaddr, saddr)]})
-        self.instrs.append({"valu": [("vbroadcast", v_n_nodes, self.scratch["n_nodes"])]})
+        # Initialize vector constants (batch 6 vbroadcasts per cycle)
+        all_vbroadcasts = [("vbroadcast", vaddr, saddr) for vaddr, saddr in self.vconst_inits]
+        all_vbroadcasts.append(("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
+        for i in range(0, len(all_vbroadcasts), 6):
+            self.instrs.append({"valu": all_vbroadcasts[i:i+6]})
 
         self.add("flow", ("pause",))
         self.add("debug", ("comment", "Starting 4-group pipelined SIMD loop"))
@@ -259,12 +285,18 @@ class KernelBuilder:
                 ("&", v_tmp1[s][3], v_val[s][3], v_one),
                 ("*", v_idx[s][3], v_idx[s][3], v_two),
             ]})
-            self.instrs.append({"valu": [
-                ("+", v_tmp2[s][g], v_tmp1[s][g], v_one) for g in range(G)
-            ]})
-            self.instrs.append({"valu": [
-                ("+", v_idx[s][g], v_idx[s][g], v_tmp2[s][g]) for g in range(G)
-            ]})
+
+            # Start val stores early since v_val is finalized after hash
+            val_stores = [("vstore", val_addr[s][g], v_val[s][g]) for g in range(G)]
+
+            self.instrs.append({
+                "valu": [("+", v_tmp2[s][g], v_tmp1[s][g], v_one) for g in range(G)],
+                "store": val_stores[:2],
+            })
+            self.instrs.append({
+                "valu": [("+", v_idx[s][g], v_idx[s][g], v_tmp2[s][g]) for g in range(G)],
+                "store": val_stores[2:4],
+            })
 
             # Wrap using multiply: idx = idx * (idx < n_nodes)
             self.instrs.append({"valu": [
@@ -274,16 +306,11 @@ class KernelBuilder:
                 ("*", v_idx[s][g], v_idx[s][g], v_tmp1[s][g]) for g in range(G)
             ]})
 
-            # Store (8 vstores, 2/cycle = 4 cycles)
+            # Store idx (val stores already done above)
             for g in range(0, G, 2):
                 self.instrs.append({"store": [
                     ("vstore", idx_addr[s][g], v_idx[s][g]),
                     ("vstore", idx_addr[s][g+1], v_idx[s][g+1]),
-                ]})
-            for g in range(0, G, 2):
-                self.instrs.append({"store": [
-                    ("vstore", val_addr[s][g], v_val[s][g]),
-                    ("vstore", val_addr[s][g+1], v_val[s][g+1]),
                 ]})
 
         def emit_pipelined_compute_with_load(compute_s, load_s, load_base_offset):
@@ -462,16 +489,11 @@ class KernelBuilder:
                 "load": load_ops,
             })
 
-            load_ops = []
-            for _ in range(2):
-                if load_idx < len(node_load_queue):
-                    g, i = node_load_queue[load_idx]
-                    load_ops.append(("load", v_node[load_s][g] + i, node_addrs[load_s][g][i]))
-                    load_idx += 1
-            self.instrs.append({
-                "valu": [("+", v_tmp2[compute_s][g], v_tmp1[compute_s][g], v_one) for g in range(G)],
-                "load": load_ops,
-            })
+            # val stores can start early since v_val is finalized after hash
+            val_stores = [
+                ("vstore", val_addr[compute_s][g], v_val[compute_s][g]) for g in range(G)
+            ]
+            val_store_idx = 0
 
             load_ops = []
             for _ in range(2):
@@ -479,10 +501,29 @@ class KernelBuilder:
                     g, i = node_load_queue[load_idx]
                     load_ops.append(("load", v_node[load_s][g] + i, node_addrs[load_s][g][i]))
                     load_idx += 1
-            self.instrs.append({
+            instr = {
+                "valu": [("+", v_tmp2[compute_s][g], v_tmp1[compute_s][g], v_one) for g in range(G)],
+                "load": load_ops,
+            }
+            if val_store_idx < len(val_stores):
+                instr["store"] = val_stores[val_store_idx:val_store_idx+2]
+                val_store_idx += 2
+            self.instrs.append(instr)
+
+            load_ops = []
+            for _ in range(2):
+                if load_idx < len(node_load_queue):
+                    g, i = node_load_queue[load_idx]
+                    load_ops.append(("load", v_node[load_s][g] + i, node_addrs[load_s][g][i]))
+                    load_idx += 1
+            instr = {
                 "valu": [("+", v_idx[compute_s][g], v_idx[compute_s][g], v_tmp2[compute_s][g]) for g in range(G)],
                 "load": load_ops,
-            })
+            }
+            if val_store_idx < len(val_stores):
+                instr["store"] = val_stores[val_store_idx:val_store_idx+2]
+                val_store_idx += 2
+            self.instrs.append(instr)
 
             # Wrap + remaining loads
             load_ops = []
@@ -518,16 +559,11 @@ class KernelBuilder:
                 if load_ops:
                     self.instrs.append({"load": load_ops})
 
-            # Store
+            # Store idx (val stores already emitted above)
             for g in range(0, G, 2):
                 self.instrs.append({"store": [
                     ("vstore", idx_addr[compute_s][g], v_idx[compute_s][g]),
                     ("vstore", idx_addr[compute_s][g+1], v_idx[compute_s][g+1]),
-                ]})
-            for g in range(0, G, 2):
-                self.instrs.append({"store": [
-                    ("vstore", val_addr[compute_s][g], v_val[compute_s][g]),
-                    ("vstore", val_addr[compute_s][g+1], v_val[compute_s][g+1]),
                 ]})
 
         # Main pipelined loop with round fusion
