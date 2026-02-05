@@ -148,6 +148,17 @@ All optimization iterations are documented in the `optimizations/` directory:
 
 ### Workflow for New Optimizations
 
+#### Using Skills (Recommended)
+1. `/new-iteration <description>` - Creates iteration file with auto-setup
+2. Document your hypothesis and approach in the file
+3. Implement changes in `perf_takehome.py`
+4. `/perf-test` - Run performance test with formatted results
+5. `/analyze-trace` - (Optional) Analyze bottlenecks if needed
+6. `/record-result` - Update documentation with results
+7. `/benchmark` - Run full validation when ready
+8. Commit with descriptive message
+
+#### Manual Workflow
 1. Copy `TEMPLATE.md` to `XXX_description.md` (use next number in sequence)
 2. Document your hypothesis and approach
 3. Implement changes in `perf_takehome.py`
@@ -155,6 +166,8 @@ All optimization iterations are documented in the `optimizations/` directory:
 5. Update the iteration file with findings
 6. Update `README.md` index table
 7. Commit with descriptive message
+
+See `.claude/skills/README.md` for detailed skill documentation.
 
 ### Current Status
 
