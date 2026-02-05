@@ -17,12 +17,13 @@ Each optimization iteration has:
 | 001 | SIMD vectorization + VLIW packing (dual groups) | 9293 | 15.9x | ✓ Tier 1 |
 | 002 | Software pipelining (overlap loads with compute) | 6173 | 23.9x | ✓ Tier 1 |
 | 003 | Eliminate vselect with math (idx = 2*idx+1+val&1) | 5661 | 26.1x | ✓ Tier 1 |
+| 004 | Eliminate wrap vselect + 4-group processing | 4525 | 32.6x | ✓ Tier 1 |
 
 ## Target Metrics
 
 - **Baseline:** 147734 cycles
 - **Target:** < 1487 cycles (Claude Opus 4.5 benchmark)
-- **Current Best:** 5661 cycles (26.1x speedup)
+- **Current Best:** 4525 cycles (32.6x speedup)
 
 ## Optimization Strategy
 
