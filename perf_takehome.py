@@ -194,11 +194,17 @@ class KernelBuilder:
                 ]})
 
             # Compute node addresses (32 ALU ops, 12/cycle = 3 cycles)
-            for g in range(G):
-                self.instrs.append({"alu": [
-                    ("+", node_addrs[s][g][i], self.scratch["forest_values_p"], v_idx[s][g] + i)
-                    for i in range(VLEN)
-                ]})
+            self.instrs.append({"alu":
+                [("+", node_addrs[s][0][i], self.scratch["forest_values_p"], v_idx[s][0] + i) for i in range(VLEN)]
+              + [("+", node_addrs[s][1][i], self.scratch["forest_values_p"], v_idx[s][1] + i) for i in range(4)]
+            })
+            self.instrs.append({"alu":
+                [("+", node_addrs[s][1][i], self.scratch["forest_values_p"], v_idx[s][1] + i) for i in range(4, VLEN)]
+              + [("+", node_addrs[s][2][i], self.scratch["forest_values_p"], v_idx[s][2] + i) for i in range(VLEN)]
+            })
+            self.instrs.append({"alu":
+                [("+", node_addrs[s][3][i], self.scratch["forest_values_p"], v_idx[s][3] + i) for i in range(VLEN)]
+            })
 
             # Load node values (32 scattered loads, 2/cycle = 16 cycles)
             for g in range(G):
@@ -335,24 +341,37 @@ class KernelBuilder:
                 ],
             })
 
-            # Hash stage 1 + compute node addresses (32 ALU ops needed)
+            # Hash stage 1 + compute node addresses (32 ALU ops, fits in 3 cycles with 12 ALU/cycle)
             hi = 1
             op1, val1, op2, op3, val3 = HASH_STAGES[hi]
             vc1 = self.hash_vconsts[(hi, 1)]
             vc3 = self.hash_vconsts[(hi, 3)]
-            for g in range(G):
-                self.instrs.append({
-                    "valu": [
-                        (op1, v_tmp1[compute_s][g], v_val[compute_s][g], vc1),
-                        (op3, v_tmp2[compute_s][g], v_val[compute_s][g], vc3),
-                    ] if g < G else [],
-                    "alu": [
-                        ("+", node_addrs[load_s][g][i], self.scratch["forest_values_p"], v_idx[load_s][g] + i)
-                        for i in range(VLEN)
-                    ],
-                })
+            # Cycle 1: 6 VALU + 12 ALU (group 0 full + group 1 partial)
+            self.instrs.append({
+                "valu": [
+                    (op1, v_tmp1[compute_s][0], v_val[compute_s][0], vc1),
+                    (op3, v_tmp2[compute_s][0], v_val[compute_s][0], vc3),
+                    (op1, v_tmp1[compute_s][1], v_val[compute_s][1], vc1),
+                    (op3, v_tmp2[compute_s][1], v_val[compute_s][1], vc3),
+                    (op1, v_tmp1[compute_s][2], v_val[compute_s][2], vc1),
+                    (op3, v_tmp2[compute_s][2], v_val[compute_s][2], vc3),
+                ],
+                "alu": [("+", node_addrs[load_s][0][i], self.scratch["forest_values_p"], v_idx[load_s][0] + i) for i in range(VLEN)]
+                     + [("+", node_addrs[load_s][1][i], self.scratch["forest_values_p"], v_idx[load_s][1] + i) for i in range(4)],
+            })
+            # Cycle 2: 2 VALU + 12 ALU (group 1 finish + group 2)
+            self.instrs.append({
+                "valu": [
+                    (op1, v_tmp1[compute_s][3], v_val[compute_s][3], vc1),
+                    (op3, v_tmp2[compute_s][3], v_val[compute_s][3], vc3),
+                ],
+                "alu": [("+", node_addrs[load_s][1][i], self.scratch["forest_values_p"], v_idx[load_s][1] + i) for i in range(4, VLEN)]
+                     + [("+", node_addrs[load_s][2][i], self.scratch["forest_values_p"], v_idx[load_s][2] + i) for i in range(VLEN)],
+            })
+            # Cycle 3: combine + 8 ALU (group 3)
             self.instrs.append({
                 "valu": [(op2, v_val[compute_s][g], v_tmp1[compute_s][g], v_tmp2[compute_s][g]) for g in range(G)],
+                "alu": [("+", node_addrs[load_s][3][i], self.scratch["forest_values_p"], v_idx[load_s][3] + i) for i in range(VLEN)],
             })
 
             # Hash stages 2-5 + load node values (32 scattered loads)
