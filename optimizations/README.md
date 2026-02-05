@@ -38,3 +38,30 @@ Planned optimization phases:
 - Include cycle count, correctness verification, and key learnings
 - Reference previous iterations when building on them
 - Track what worked and what didn't for future reference
+
+## Pre-Submission Checklist
+
+Before claiming any result, verify:
+
+```bash
+# 1. Tests folder unchanged (MUST be empty output)
+git diff origin/main tests/
+
+# 2. Run submission validation
+python tests/submission_tests.py
+
+# 3. Record cycles and which tiers pass
+```
+
+## Performance Tiers
+
+| Tier | Cycles | Speedup | Milestone |
+|------|--------|---------|-----------|
+| Start | < 147,734 | > 1× | Beat baseline |
+| Tier 1 | < 18,532 | > 8× | Updated starting point |
+| Tier 2 | < 2,164 | > 68× | Opus 4 many hours |
+| Tier 3 | < 1,790 | > 83× | Opus 4.5 casual |
+| Tier 4 | < 1,579 | > 94× | Opus 4.5 2hr |
+| Tier 5 | < 1,548 | > 95× | Sonnet 4.5 many hours |
+| **TARGET** | < **1,487** | > **99×** | **Opus 4.5 11hr** |
+| Ultimate | < 1,363 | > 108× | Opus 4.5 improved |

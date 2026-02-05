@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Quick Start
+
+```
+EDIT: perf_takehome.py → KernelBuilder.build_kernel() (lines 88-174)
+TEST: python perf_takehome.py Tests.test_kernel_cycles
+VALIDATE: python tests/submission_tests.py
+
+Baseline: 147734 cycles → Target: <1487 cycles (99% reduction)
+```
+
+**Golden Rule:** NEVER modify `tests/` folder. Verify with `git diff origin/main tests/`
+
 ## Overview
 
 This is Anthropic's original performance engineering take-home challenge. The task is to optimize a kernel that simulates parallel tree traversal operations on a custom VLIW SIMD architecture. The goal is to minimize the cycle count as measured by the frozen simulator in `tests/frozen_problem.py`.
@@ -130,6 +142,60 @@ The memory image contains:
 [7+]: actual data (tree values, indices, values, extra room)
 ```
 
+## ISA Quick Reference
+
+### Instruction Bundle Format
+```python
+{"alu": [(op, dest, a1, a2), ...], "valu": [...], "load": [...], "store": [...], "flow": [...]}
+```
+
+### ALU Operations (12 slots/cycle)
+```
+("+", dest, a, b)   # dest = a + b
+("-", dest, a, b)   # dest = a - b
+("*", dest, a, b)   # dest = a * b
+("//", dest, a, b)  # dest = a // b (floor div)
+("%", dest, a, b)   # dest = a % b
+("^", dest, a, b)   # dest = a XOR b
+("&", dest, a, b)   # dest = a AND b
+("|", dest, a, b)   # dest = a OR b
+("<<", dest, a, b)  # dest = a << b
+(">>", dest, a, b)  # dest = a >> b
+("<", dest, a, b)   # dest = 1 if a < b else 0
+("==", dest, a, b)  # dest = 1 if a == b else 0
+```
+
+### VALU Operations (6 slots/cycle) - operates on VLEN=8 elements
+```
+("vbroadcast", dest, src)        # dest[0:8] = src (scalar to vector)
+("+", dest, a, b)                # dest[i] = a[i] + b[i] for i in 0..7
+("multiply_add", dest, a, b, c)  # dest[i] = a[i] * b[i] + c[i]
+# All ALU ops work element-wise on vectors
+```
+
+### Load Operations (2 slots/cycle)
+```
+("const", dest, value)           # dest = immediate value
+("load", dest, addr_scratch)     # dest = mem[scratch[addr_scratch]]
+("vload", dest, addr_scratch)    # dest[0:8] = mem[scratch[addr]:scratch[addr]+8]
+```
+
+### Store Operations (2 slots/cycle)
+```
+("store", addr_scratch, src)     # mem[scratch[addr]] = scratch[src]
+("vstore", addr_scratch, src)    # mem[scratch[addr]:+8] = scratch[src:src+8]
+```
+
+### Flow Operations (1 slot/cycle)
+```
+("select", dest, cond, a, b)     # dest = a if cond != 0 else b
+("vselect", dest, cond, a, b)    # vector select, element-wise
+("jump", addr)                   # pc = addr (immediate)
+("cond_jump", cond, addr)        # if cond != 0: pc = addr
+("halt",)                        # stop execution
+("pause",)                       # pause for debug sync (ignored in submission)
+```
+
 ## Debugging Tips
 
 - Use `trace=True` with `watch_trace.py` to visualize instruction execution in Perfetto
@@ -174,3 +240,43 @@ See `.claude/skills/README.md` for detailed skill documentation.
 - **Baseline:** 147734 cycles
 - **Target:** < 1487 cycles (99% speedup needed)
 - **Best:** Check `optimizations/README.md` for current best result
+
+## Scratch Space Planning
+
+Total: 1536 words. Plan allocation carefully for SIMD.
+
+```
+Scalar variables: 1 word each
+Vector variables: 8 words each (VLEN=8)
+Constants: Can be shared via scratch_const()
+
+Example SIMD allocation:
+- 7 init vars (rounds, n_nodes, etc.): 7 words
+- 3 scalar temps: 3 words
+- Vector indices (32 elements): 32 words
+- Vector values (32 elements): 32 words
+- Vector temps for hash (8 per stage × 6): 48 words
+- Constants: ~20 words
+Total: ~142 words (plenty of room)
+```
+
+## Common VLIW Packing Patterns
+
+```python
+# BAD: One instruction per bundle (baseline)
+self.add("alu", ("+", a, b, c))
+self.add("alu", ("*", d, e, f))  # 2 cycles
+
+# GOOD: Pack independent ops into one bundle
+self.instrs.append({
+    "alu": [("+", a, b, c), ("*", d, e, f)],
+    "load": [("load", x, y)]
+})  # 1 cycle
+
+# GOOD: Mix engines in one bundle
+self.instrs.append({
+    "alu": [("+", a, b, c)],
+    "valu": [("vbroadcast", v, s)],
+    "load": [("vload", data, addr)]
+})  # 1 cycle, using 3 engines
+```
