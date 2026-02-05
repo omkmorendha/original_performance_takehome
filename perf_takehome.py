@@ -263,22 +263,24 @@ class KernelBuilder:
                     (op2, v_val[s][vb], v_tmp1[s][vb], v_tmp2[s][vb]),
                 ]})
 
-            # Index calculation
+            # Index calculation: idx = 2*idx + 1 + (val & 1)
+            # Using (val & 1) instead of select: 0 for even, 1 for odd
+            # So idx = 2*idx + 1 + (val & 1) gives: 2*idx+1 for even, 2*idx+2 for odd
             self.instrs.append({"valu": [
-                ("%", v_tmp1[s][va], v_val[s][va], v_two),
-                ("*", v_idx[s][va], v_idx[s][va], v_two),
-                ("%", v_tmp1[s][vb], v_val[s][vb], v_two),
+                ("&", v_tmp1[s][va], v_val[s][va], v_one),  # val & 1
+                ("*", v_idx[s][va], v_idx[s][va], v_two),   # idx * 2
+                ("&", v_tmp1[s][vb], v_val[s][vb], v_one),
                 ("*", v_idx[s][vb], v_idx[s][vb], v_two),
             ]})
+            # tmp1 now has (val & 1), need to add 1 + tmp1 to idx
+            # Use tmp2 to store 1 + tmp1, then add to idx
             self.instrs.append({"valu": [
-                ("==", v_cond[s][va], v_tmp1[s][va], v_zero),
-                ("==", v_cond[s][vb], v_tmp1[s][vb], v_zero),
+                ("+", v_tmp2[s][va], v_tmp1[s][va], v_one),  # 1 + (val & 1)
+                ("+", v_tmp2[s][vb], v_tmp1[s][vb], v_one),
             ]})
-            self.instrs.append({"flow": [("vselect", v_tmp3[s][va], v_cond[s][va], v_one, v_two)]})
-            self.instrs.append({"flow": [("vselect", v_tmp3[s][vb], v_cond[s][vb], v_one, v_two)]})
             self.instrs.append({"valu": [
-                ("+", v_idx[s][va], v_idx[s][va], v_tmp3[s][va]),
-                ("+", v_idx[s][vb], v_idx[s][vb], v_tmp3[s][vb]),
+                ("+", v_idx[s][va], v_idx[s][va], v_tmp2[s][va]),  # idx + (1 + val&1)
+                ("+", v_idx[s][vb], v_idx[s][vb], v_tmp2[s][vb]),
             ]})
 
             # Wrap indices
@@ -426,14 +428,14 @@ class KernelBuilder:
                 self.instrs.append(instr)
 
             # Continue with remaining node loads for group B during index calculation
-            node_load_idx_b = 0
+            # Using optimized index calc: idx = 2*idx + 1 + (val & 1)
 
-            # mod/mul + load node_val_b[0:2]
+            # (val & 1) and (idx * 2) + load node_val_b[0:2]
             self.instrs.append({
                 "valu": [
-                    ("%", v_tmp1[compute_s][va], v_val[compute_s][va], v_two),
+                    ("&", v_tmp1[compute_s][va], v_val[compute_s][va], v_one),
                     ("*", v_idx[compute_s][va], v_idx[compute_s][va], v_two),
-                    ("%", v_tmp1[compute_s][vb], v_val[compute_s][vb], v_two),
+                    ("&", v_tmp1[compute_s][vb], v_val[compute_s][vb], v_one),
                     ("*", v_idx[compute_s][vb], v_idx[compute_s][vb], v_two),
                 ],
                 "load": [
@@ -442,11 +444,11 @@ class KernelBuilder:
                 ],
             })
 
-            # equality + load node_val_b[2:4]
+            # (1 + val&1) + load node_val_b[2:4]
             self.instrs.append({
                 "valu": [
-                    ("==", v_cond[compute_s][va], v_tmp1[compute_s][va], v_zero),
-                    ("==", v_cond[compute_s][vb], v_tmp1[compute_s][vb], v_zero),
+                    ("+", v_tmp2[compute_s][va], v_tmp1[compute_s][va], v_one),
+                    ("+", v_tmp2[compute_s][vb], v_tmp1[compute_s][vb], v_one),
                 ],
                 "load": [
                     ("load", v_node_val[load_s][1] + 2, node_addrs_b[2]),
@@ -454,37 +456,31 @@ class KernelBuilder:
                 ],
             })
 
-            # vselect + load node_val_b[4:6]
+            # idx += (1 + val&1) + load node_val_b[4:6]
             self.instrs.append({
-                "flow": [("vselect", v_tmp3[compute_s][va], v_cond[compute_s][va], v_one, v_two)],
+                "valu": [
+                    ("+", v_idx[compute_s][va], v_idx[compute_s][va], v_tmp2[compute_s][va]),
+                    ("+", v_idx[compute_s][vb], v_idx[compute_s][vb], v_tmp2[compute_s][vb]),
+                ],
                 "load": [
                     ("load", v_node_val[load_s][1] + 4, node_addrs_b[4]),
                     ("load", v_node_val[load_s][1] + 5, node_addrs_b[5]),
                 ],
             })
 
-            # vselect + load node_val_b[6:8]
+            # wrap check + load node_val_b[6:8]
             self.instrs.append({
-                "flow": [("vselect", v_tmp3[compute_s][vb], v_cond[compute_s][vb], v_one, v_two)],
+                "valu": [
+                    ("<", v_cond[compute_s][va], v_idx[compute_s][va], v_n_nodes),
+                    ("<", v_cond[compute_s][vb], v_idx[compute_s][vb], v_n_nodes),
+                ],
                 "load": [
                     ("load", v_node_val[load_s][1] + 6, node_addrs_b[6]),
                     ("load", v_node_val[load_s][1] + 7, node_addrs_b[7]),
                 ],
             })
 
-            # add
-            self.instrs.append({"valu": [
-                ("+", v_idx[compute_s][va], v_idx[compute_s][va], v_tmp3[compute_s][va]),
-                ("+", v_idx[compute_s][vb], v_idx[compute_s][vb], v_tmp3[compute_s][vb]),
-            ]})
-
-            # compare
-            self.instrs.append({"valu": [
-                ("<", v_cond[compute_s][va], v_idx[compute_s][va], v_n_nodes),
-                ("<", v_cond[compute_s][vb], v_idx[compute_s][vb], v_n_nodes),
-            ]})
-
-            # vselect wrap
+            # vselect for wrap (still needed - can't easily eliminate)
             self.instrs.append({"flow": [("vselect", v_idx[compute_s][va], v_cond[compute_s][va], v_idx[compute_s][va], v_zero)]})
             self.instrs.append({"flow": [("vselect", v_idx[compute_s][vb], v_cond[compute_s][vb], v_idx[compute_s][vb], v_zero)]})
 
