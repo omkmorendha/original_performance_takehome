@@ -235,6 +235,132 @@ All optimization iterations are documented in the `optimizations/` directory:
 
 See `.claude/skills/README.md` for detailed skill documentation.
 
+## Git Workflow
+
+### Branch Strategy
+
+Always work on feature branches, never directly on `main`:
+
+```bash
+# Create a new branch for each optimization iteration
+git checkout -b opt/001-simd-vectorization
+
+# Or for bug fixes
+git checkout -b fix/hash-constant-initialization
+```
+
+### Branch Naming Conventions
+
+- `opt/XXX-description` - Optimization iterations (e.g., `opt/001-simd-vectorization`)
+- `fix/description` - Bug fixes (e.g., `fix/scattered-load-bug`)
+- `refactor/description` - Code refactoring (e.g., `refactor/extract-hash-function`)
+- `docs/description` - Documentation updates (e.g., `docs/update-readme`)
+
+### Commit Workflow
+
+1. **Stage specific files** (avoid `git add .` or `git add -A`):
+   ```bash
+   git add perf_takehome.py
+   git add optimizations/001_simd_vectorization.md
+   ```
+
+2. **Write descriptive commit messages**:
+   ```bash
+   git commit -m "feat(opt): implement SIMD vectorization with dual-group processing
+
+   - Process 16 elements per iteration (2 groups of 8)
+   - Vectorize hash function with parallel VALU operations
+   - Pack operations across ALU, VALU, Load, Store engines
+
+   Cycles: 9293 (15.9x speedup from baseline)
+
+   Co-Authored-By: Claude <noreply@anthropic.com>"
+   ```
+
+3. **Commit message format**:
+   - `feat(opt):` - New optimization
+   - `fix:` - Bug fix
+   - `refactor:` - Code restructuring
+   - `docs:` - Documentation changes
+   - `test:` - Test-related changes (but NOT modifying tests/ folder!)
+
+### Merging to Main
+
+1. **Ensure tests pass before merging**:
+   ```bash
+   python perf_takehome.py Tests.test_kernel_cycles
+   python tests/submission_tests.py
+   ```
+
+2. **Verify tests folder is unchanged**:
+   ```bash
+   git diff origin/main tests/  # MUST be empty
+   ```
+
+3. **Merge with a merge commit** (preserves history):
+   ```bash
+   git checkout main
+   git merge --no-ff opt/001-simd-vectorization -m "Merge opt/001: SIMD vectorization (9293 cycles)"
+   ```
+
+4. **Or use squash merge** for cleaner history:
+   ```bash
+   git checkout main
+   git merge --squash opt/001-simd-vectorization
+   git commit -m "feat(opt): SIMD vectorization achieving 9293 cycles (15.9x speedup)"
+   ```
+
+### Pre-Merge Checklist
+
+Before merging ANY branch to main:
+
+- [ ] `python perf_takehome.py Tests.test_kernel_cycles` passes
+- [ ] `python tests/submission_tests.py` correctness tests pass
+- [ ] `git diff origin/main tests/` is empty (tests unchanged)
+- [ ] Optimization documentation updated in `optimizations/`
+- [ ] `optimizations/README.md` index table updated
+
+### Handling Failed Experiments
+
+If an optimization doesn't work out:
+
+```bash
+# Document what was tried in the iteration file
+# Mark status as "✗ Failed" with lessons learned
+# Still commit to preserve the learning
+
+git add optimizations/002_failed_experiment.md
+git commit -m "docs(opt): document failed software pipelining attempt
+
+Attempted to overlap loads with computation but introduced
+race conditions. Key lesson: need separate register sets for
+pipelining across iterations."
+
+# Either merge to main for documentation, or delete branch
+git checkout main
+git branch -D opt/002-failed-pipelining  # If not worth keeping
+```
+
+### Useful Git Commands
+
+```bash
+# View optimization history
+git log --oneline --grep="opt"
+
+# Compare current performance vs main
+git stash
+git checkout main
+python perf_takehome.py Tests.test_kernel_cycles
+git checkout -
+git stash pop
+
+# See what changed in perf_takehome.py
+git diff main -- perf_takehome.py
+
+# Revert to last working state (CAREFUL - loses uncommitted work)
+git checkout -- perf_takehome.py
+```
+
 ### Current Status
 
 - **Baseline:** 147734 cycles

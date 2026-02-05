@@ -14,12 +14,13 @@ Each optimization iteration has:
 | Iteration | Description | Cycles | Speedup | Status |
 |-----------|-------------|--------|---------|--------|
 | 000 | Baseline (original scalar implementation) | 147734 | 1.00x | ✓ Baseline |
+| 001 | SIMD vectorization + VLIW packing (dual groups) | 9293 | 15.9x | ✓ Tier 1 |
 
 ## Target Metrics
 
 - **Baseline:** 147734 cycles
 - **Target:** < 1487 cycles (Claude Opus 4.5 benchmark)
-- **Current Best:** TBD
+- **Current Best:** 9293 cycles (15.9x speedup)
 
 ## Optimization Strategy
 
