@@ -530,21 +530,32 @@ class KernelBuilder:
                     ("vstore", val_addr[compute_s][g+1], v_val[compute_s][g+1]),
                 ]})
 
-        # Main pipelined loop
-        for round_idx in range(rounds):
-            # Prologue: Load first iteration
-            emit_load_phase(0, 0)
+        # Main pipelined loop with round fusion
+        # Instead of separate prologue/epilogue per round, we fuse:
+        # Round N last iter can overlap with Round N+1 first iter load
 
-            # Steady state: compute current while loading next
+        # First round prologue
+        emit_load_phase(0, 0)
+
+        for round_idx in range(rounds):
+            is_last_round = (round_idx == rounds - 1)
+
+            # Steady state iterations (all but last of this round)
             for it in range(n_iters - 1):
                 current_buf = it % 2
                 next_buf = 1 - current_buf
                 next_offset = (it + 1) * G * VLEN
                 emit_pipelined_compute_with_load(current_buf, next_buf, next_offset)
 
-            # Epilogue: compute last iteration (no more loads)
+            # Last iteration of this round
             last_buf = (n_iters - 1) % 2
-            emit_compute_phase(last_buf)
+
+            if is_last_round:
+                # Final round: just compute, no more loads
+                emit_compute_phase(last_buf)
+            else:
+                # Fuse with next round's first load (offset 0)
+                emit_pipelined_compute_with_load(last_buf, 1 - last_buf, 0)
 
         self.instrs.append({"flow": [("pause",)]})
 
