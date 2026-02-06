@@ -388,7 +388,7 @@ class KernelBuilder:
                 "valu": [("^", cur_val[g], cur_val[g], v_node[g]) for g in range(6)],
                 "alu": next_addr_calcs(12),
             })
-            # Cy2: XOR g6-7 + H0 madd g0-3 + addr calc
+            # Cy2: XOR g6-7 + H0 madd g0-3 + addr calc + first loads
             vc_mul0 = self.hash_vconsts[(0, "mul")]
             vc_add0 = self.hash_vconsts[(0, "add")]
             self.instrs.append({
@@ -401,6 +401,7 @@ class KernelBuilder:
                     ("multiply_add", cur_val[3], cur_val[3], vc_mul0, vc_add0),
                 ],
                 "alu": next_addr_calcs(12),
+                "load": next_loads(),  # uses addrs from Cy1
             })
             # Cy3: H0 madd g4-7 + H1 op13 g0 + addr calc + first loads
             hi = 1
@@ -682,34 +683,135 @@ class KernelBuilder:
             # Idx update
             emit_idx_update_g8(cur_idx, cur_val)
 
+        # --- Broadcast support: preload tree values for depths 0-1 ---
+        MAX_BC_DEPTH = 1  # broadcast for depths 0-1
+        # Preload tree[0], tree[1], tree[2] as scalar values
+        tree_cache = [self.alloc_scratch(f"tc_{i}") for i in range(3)]
+        # tree[0] is at forest_values_p + 0
+        self.instrs.append({"load": [
+            ("load", tree_cache[0], self.scratch["forest_values_p"]),
+        ]})
+        # tree[1] at forest_values_p+1, tree[2] at forest_values_p+2
+        tc_addr1 = self.alloc_scratch("tc_a1")
+        tc_addr2 = self.alloc_scratch("tc_a2")
+        self.instrs.append({"alu": [
+            ("+", tc_addr1, self.scratch["forest_values_p"], one_const),
+            ("+", tc_addr2, self.scratch["forest_values_p"], two_const),
+        ]})
+        self.instrs.append({"load": [
+            ("load", tree_cache[1], tc_addr1),
+            ("load", tree_cache[2], tc_addr2),
+        ]})
+
+        # Broadcast vector constants for tree values
+        v_tree = [self.alloc_scratch(f"v_tree_{i}", VLEN) for i in range(3)]
+        self.instrs.append({"valu": [
+            ("vbroadcast", v_tree[0], tree_cache[0]),
+            ("vbroadcast", v_tree[1], tree_cache[1]),
+            ("vbroadcast", v_tree[2], tree_cache[2]),
+        ]})
+
+        # Precompute diff and base for depth-1 selection
+        # tree[1] if idx is odd (idx&1=1), tree[2] if idx is even (idx&1=0)
+        # result = (tree[1]-tree[2]) * (idx&1) + tree[2] = multiply_add(diff, mask, tree2)
+        v_tree_d1_diff = self.alloc_scratch("v_td1_diff", VLEN)
+        self.instrs.append({"valu": [
+            ("-", v_tree_d1_diff, v_tree[1], v_tree[2]),
+        ]})
+
+        def get_round_depth(round_idx):
+            return round_idx % (forest_height + 1)
+
+        def is_broadcast_round(round_idx):
+            return get_round_depth(round_idx) <= MAX_BC_DEPTH
+
+        def emit_broadcast_tree_value(depth, idx_addrs):
+            """Set v_node[g] = tree value based on idx, using broadcast selection."""
+            if depth == 0:
+                # All elements access tree[0]
+                for g in range(0, G, 6):
+                    end = min(g + 6, G)
+                    self.instrs.append({"valu": [
+                        ("vbroadcast", v_node[gg], tree_cache[0]) for gg in range(g, end)
+                    ]})
+            elif depth == 1:
+                # tree[1] if idx&1==1, tree[2] if idx&1==0
+                # v_node = multiply_add(v_tree_d1_diff, idx&1, v_tree[2])
+                # First compute masks, then multiply_add
+                for g in range(0, G, 6):
+                    end = min(g + 6, G)
+                    self.instrs.append({"valu": [
+                        ("&", v_tmp1[gg], idx_addrs[gg], v_one) for gg in range(g, end)
+                    ]})
+                for g in range(0, G, 6):
+                    end = min(g + 6, G)
+                    self.instrs.append({"valu": [
+                        ("multiply_add", v_node[gg], v_tree_d1_diff, v_tmp1[gg], v_tree[2]) for gg in range(g, end)
+                    ]})
+
         # ================================================================
-        # MAIN LOOP: 16 rounds × 4 iterations, all scratch-resident
+        # MAIN LOOP: 16 rounds × 4 iterations, with broadcast for d0-d1
         # ================================================================
+        need_tree_load = True  # whether v_node needs to be loaded for current iter
+
         for round_idx in range(rounds):
+            depth = get_round_depth(round_idx)
+            bc = depth <= MAX_BC_DEPTH
+
             for it in range(n_iters):
                 is_very_last = (round_idx == rounds - 1 and it == n_iters - 1)
+                cur_idx, cur_val = get_groups(it)
 
-                if round_idx == 0 and it == 0:
-                    # Prologue: load tree for it0, compute it0, then load tree for it1
-                    cur_idx, cur_val = get_groups(0)
+                # Determine next iteration
+                next_it = it + 1
+                next_round = round_idx
+                if next_it >= n_iters:
+                    next_it = 0
+                    next_round = round_idx + 1
+                next_bc = (next_round < rounds and
+                           get_round_depth(next_round) <= MAX_BC_DEPTH)
+
+                if bc:
+                    # Broadcast round: compute tree values via selection
+                    emit_broadcast_tree_value(depth, cur_idx)
+                    # Compute: XOR + hash + idx update (no loads)
+                    emit_compute_iter_g8(it)
+                    # If next iteration needs scattered loads, load them
+                    if not is_very_last and not next_bc and next_it == 0:
+                        # Transitioning from broadcast to scattered round
+                        next_idx, _ = get_groups(next_it)
+                        emit_node_addr_calc_g8(next_idx, next_node_addrs)
+                        emit_scattered_loads_g8(next_node_addrs, v_node)
+                elif need_tree_load:
+                    # First scattered iter of round: need to load tree values
                     emit_node_addr_calc_g8(cur_idx, node_addrs)
                     emit_scattered_loads_g8(node_addrs, v_node)
-                    emit_compute_iter_g8(0)
-                    # Load tree values for it1 (transition into pipeline)
-                    if not (rounds == 1 and n_iters == 1):
-                        next_idx_1, _ = get_groups(1 if n_iters > 1 else 0)
-                        emit_node_addr_calc_g8(next_idx_1, next_node_addrs)
-                        emit_scattered_loads_g8(next_node_addrs, v_node)
+                    emit_compute_iter_g8(it)
+                    if not is_very_last:
+                        next_idx, _ = get_groups(next_it)
+                        if next_bc and next_it == 0:
+                            pass  # next round is broadcast, no load needed
+                        else:
+                            emit_node_addr_calc_g8(next_idx, next_node_addrs)
+                            emit_scattered_loads_g8(next_node_addrs, v_node)
                 elif is_very_last:
                     emit_compute_iter_g8(it)
                 else:
-                    next_it = it + 1
-                    next_round = round_idx
-                    if next_it >= n_iters:
-                        next_it = 0
-                        next_round = round_idx + 1
+                    # Pipelined scattered iteration
                     next_idx, _ = get_groups(next_it)
-                    emit_pipelined_iter_g8(it, next_idx)
+                    if next_bc and next_it == 0:
+                        # Next round is broadcast, don't load tree values
+                        emit_compute_iter_g8(it)
+                    else:
+                        emit_pipelined_iter_g8(it, next_idx)
+
+                # Track whether next iteration needs tree loading
+                if bc:
+                    need_tree_load = False  # broadcast rounds manage their own
+                elif it == 0 and not bc:
+                    need_tree_load = False  # we just did the initial load
+                else:
+                    need_tree_load = False  # pipeline handles it
 
         # --- Final store: write all idx and val back to memory ---
         for g in range(0, n_groups, 2):
