@@ -117,6 +117,7 @@ class KernelBuilder:
         aggressive interleaving. All idx/val kept in scratch across all rounds."""
         self.vconst_inits = []
         G = 8  # groups per iteration (64 elements)
+        USE_D2_VSELECT = False  # experimental depth-2 vselect path
 
         # --- Scratch allocation ---
         tmp1 = self.alloc_scratch("tmp1")
@@ -142,6 +143,9 @@ class KernelBuilder:
         v_node = [self.alloc_scratch(f"v_node_g{g}", VLEN) for g in range(G)]
         v_tmp1 = [self.alloc_scratch(f"v_tmp1_g{g}", VLEN) for g in range(G)]
         v_tmp2 = [self.alloc_scratch(f"v_tmp2_g{g}", VLEN) for g in range(G)]
+        v_sel01 = None
+        if USE_D2_VSELECT:
+            v_sel01 = [self.alloc_scratch(f"v_sel01_g{g}", VLEN) for g in range(G)]
 
         # Node addresses for scattered loads
         node_addrs = [[self.alloc_scratch(f"na_g{g}_{i}") for i in range(VLEN)]
@@ -735,7 +739,7 @@ class KernelBuilder:
                 if ld:
                     self.instrs.append({"load": ld})
 
-        def emit_compute_iter_g8(it, prep_store=False):
+        def emit_compute_iter_g8(it, prep_store=False, wrap=True):
             """Interleaved compute for G=8: 24 VALU cycles.
             Uses same schedule as pipelined version but without extra loads/ALU.
             If prep_store=True, uses idle ALU cycles to pre-compute first store addresses."""
@@ -905,24 +909,30 @@ class KernelBuilder:
                 ("+", I[2], T2[2], T1[2]), ("+", I[3], T2[3], T1[3]),
                 ("+", I[4], T2[4], T1[4]), ("+", I[5], T2[5], T1[5]),
             ]})
-            # Cy22: + g6-7, < g0-3
-            self.instrs.append({"valu": [
-                ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
-                ("<", T1[0], I[0], v_n_nodes), ("<", T1[1], I[1], v_n_nodes),
-                ("<", T1[2], I[2], v_n_nodes), ("<", T1[3], I[3], v_n_nodes),
-            ]})
-            # Cy23: < g4-7, wrap g0-1
-            self.instrs.append({"valu": [
-                ("<", T1[4], I[4], v_n_nodes), ("<", T1[5], I[5], v_n_nodes),
-                ("<", T1[6], I[6], v_n_nodes), ("<", T1[7], I[7], v_n_nodes),
-                ("*", I[0], I[0], T1[0]), ("*", I[1], I[1], T1[1]),
-            ]})
-            # Cy24: wrap g2-7
-            self.instrs.append({"valu": [
-                ("*", I[2], I[2], T1[2]), ("*", I[3], I[3], T1[3]),
-                ("*", I[4], I[4], T1[4]), ("*", I[5], I[5], T1[5]),
-                ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
-            ]})
+            if wrap:
+                # Cy22: + g6-7, < g0-3
+                self.instrs.append({"valu": [
+                    ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
+                    ("<", T1[0], I[0], v_n_nodes), ("<", T1[1], I[1], v_n_nodes),
+                    ("<", T1[2], I[2], v_n_nodes), ("<", T1[3], I[3], v_n_nodes),
+                ]})
+                # Cy23: < g4-7, wrap g0-1
+                self.instrs.append({"valu": [
+                    ("<", T1[4], I[4], v_n_nodes), ("<", T1[5], I[5], v_n_nodes),
+                    ("<", T1[6], I[6], v_n_nodes), ("<", T1[7], I[7], v_n_nodes),
+                    ("*", I[0], I[0], T1[0]), ("*", I[1], I[1], T1[1]),
+                ]})
+                # Cy24: wrap g2-7
+                self.instrs.append({"valu": [
+                    ("*", I[2], I[2], T1[2]), ("*", I[3], I[3], T1[3]),
+                    ("*", I[4], I[4], T1[4]), ("*", I[5], I[5], T1[5]),
+                    ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
+                ]})
+            else:
+                # Cy22: + g6-7 only (no wrap needed)
+                self.instrs.append({"valu": [
+                    ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
+                ]})
 
         def emit_compute_iter_d0_g8(it, wrap=True, idx_zero=False):
             """Compute for depth-0 rounds: XOR directly with v_tree[0], skip vbroadcast.
@@ -1642,10 +1652,51 @@ class KernelBuilder:
                 if ld:
                     self.instrs.append({"load": ld})
 
-        # --- Broadcast support: preload tree values for depths 0-1 ---
-        MAX_BC_DEPTH = 1  # broadcast for depths 0-1
-        # Preload tree[0], tree[1], tree[2] as scalar values
-        tree_cache = [self.alloc_scratch(f"tc_{i}") for i in range(3)]
+        def emit_select_d2_vselect_g8(idx_addrs):
+            """Depth-2 selection using vselect (flow engine)."""
+            if not USE_D2_VSELECT:
+                return
+            I = idx_addrs
+            T1, T2 = v_tmp1, v_tmp2  # T1 = b0, T2 = b1
+            # Compute b0 = idx & 1
+            self.instrs.append({"valu": [("&", T1[g], I[g], v_one) for g in range(6)]})
+            # Compute b0 g6-7 and b1 shift g0-3
+            self.instrs.append({"valu": [
+                ("&", T1[6], I[6], v_one), ("&", T1[7], I[7], v_one),
+                (">>", T2[0], I[0], v_one), (">>", T2[1], I[1], v_one),
+                (">>", T2[2], I[2], v_one), (">>", T2[3], I[3], v_one),
+            ]})
+            # b1 shift g4-7 + b1 & g0-1
+            self.instrs.append({"valu": [
+                (">>", T2[4], I[4], v_one), (">>", T2[5], I[5], v_one),
+                (">>", T2[6], I[6], v_one), (">>", T2[7], I[7], v_one),
+                ("&", T2[0], T2[0], v_one), ("&", T2[1], T2[1], v_one),
+            ]})
+            # b1 & g2-7
+            self.instrs.append({"valu": [
+                ("&", T2[2], T2[2], v_one), ("&", T2[3], T2[3], v_one),
+                ("&", T2[4], T2[4], v_one), ("&", T2[5], T2[5], v_one),
+                ("&", T2[6], T2[6], v_one), ("&", T2[7], T2[7], v_one),
+            ]})
+
+            # v_node selection via flow vselect (3 per group)
+            # Mapping based on idx bits:
+            # b1=0 -> {tree[4], tree[5]} via b0
+            # b1=1 -> {tree[6], tree[3]} via b0
+            for g in range(G):
+                self.instrs.append({"flow": [
+                    ("vselect", v_sel01[g], T1[g], v_tree[5], v_tree[4]),
+                ]})
+                self.instrs.append({"flow": [
+                    ("vselect", v_node[g], T1[g], v_tree[3], v_tree[6]),
+                ]})
+                self.instrs.append({"flow": [
+                    ("vselect", v_node[g], T2[g], v_node[g], v_sel01[g]),
+                ]})
+
+        # --- Broadcast support: preload tree values for depths 0-1 (and optional d2) ---
+        MAX_BC_DEPTH = 2 if USE_D2_VSELECT else 1
+        tree_cache = [self.alloc_scratch(f"tc_{i}") for i in range(7 if USE_D2_VSELECT else 3)]
         # tree[0] is at forest_values_p + 0
         self.instrs.append({"load": [
             ("load", tree_cache[0], self.scratch["forest_values_p"]),
@@ -1662,13 +1713,37 @@ class KernelBuilder:
             ("load", tree_cache[2], tc_addr2),
         ]})
 
+        if USE_D2_VSELECT:
+            tc_addr3 = self.alloc_scratch("tc_a3")
+            tc_addr4 = self.alloc_scratch("tc_a4")
+            tc_addr5 = self.alloc_scratch("tc_a5")
+            tc_addr6 = self.alloc_scratch("tc_a6")
+            c3 = self.scratch_const(3)
+            c4 = self.scratch_const(4)
+            c5 = self.scratch_const(5)
+            c6 = self.scratch_const(6)
+            self.instrs.append({"alu": [
+                ("+", tc_addr3, self.scratch["forest_values_p"], c3),
+                ("+", tc_addr4, self.scratch["forest_values_p"], c4),
+                ("+", tc_addr5, self.scratch["forest_values_p"], c5),
+                ("+", tc_addr6, self.scratch["forest_values_p"], c6),
+            ]})
+            self.instrs.append({"load": [
+                ("load", tree_cache[3], tc_addr3),
+                ("load", tree_cache[4], tc_addr4),
+            ]})
+            self.instrs.append({"load": [
+                ("load", tree_cache[5], tc_addr5),
+                ("load", tree_cache[6], tc_addr6),
+            ]})
+
         # Broadcast vector constants for tree values
-        v_tree = [self.alloc_scratch(f"v_tree_{i}", VLEN) for i in range(3)]
-        self.instrs.append({"valu": [
-            ("vbroadcast", v_tree[0], tree_cache[0]),
-            ("vbroadcast", v_tree[1], tree_cache[1]),
-            ("vbroadcast", v_tree[2], tree_cache[2]),
-        ]})
+        v_tree = [self.alloc_scratch(f"v_tree_{i}", VLEN) for i in range(7 if USE_D2_VSELECT else 3)]
+        for i in range(0, len(v_tree), 6):
+            end = min(i + 6, len(v_tree))
+            self.instrs.append({"valu": [
+                ("vbroadcast", v_tree[j], tree_cache[j]) for j in range(i, end)
+            ]})
 
         # Precompute diff and base for depth-1 selection
         # tree[1] if idx is odd (idx&1=1), tree[2] if idx is even (idx&1=0)
@@ -1731,21 +1806,31 @@ class KernelBuilder:
                            get_round_depth(next_round) <= MAX_BC_DEPTH)
 
                 if bc:
-                    # Check if this is a d1 transition to scattered round
-                    is_d1_transition = (depth == 1 and not is_very_last
-                                        and not next_bc and next_it == 0)
+                    did_transition = False
                     if depth == 0:
                         # d0: XOR directly with v_tree[0], skip vbroadcast + wrap
                         emit_compute_iter_d0_g8(it, wrap=False, idx_zero=True)
-                    elif is_d1_transition:
-                        # d1 transition: fused selection + compute + addr calc + loads
-                        next_idx, _ = get_groups(next_it)
-                        emit_compute_iter_d1_pipelined_g8(it, next_idx)
                     else:
-                        # d1: fused selection + compute (no transition, no wrap)
-                        emit_compute_iter_d1_g8(it, wrap=False)
-                    # If next iteration needs scattered loads (d0 case only now)
-                    if not is_d1_transition and not is_very_last and not next_bc and next_it == 0:
+                        # Check if this is a d1 transition to scattered round
+                        is_d1_transition = (depth == 1 and not is_very_last
+                                            and not next_bc and next_it == 0)
+                        if depth == 1 and is_d1_transition:
+                            # d1 transition: fused selection + compute + addr calc + loads
+                            next_idx, _ = get_groups(next_it)
+                            emit_compute_iter_d1_pipelined_g8(it, next_idx)
+                            did_transition = True
+                        elif depth == 1:
+                            # d1: fused selection + compute (no transition, no wrap)
+                            emit_compute_iter_d1_g8(it, wrap=False)
+                        elif depth == 2 and USE_D2_VSELECT:
+                            # d2: select via vselect then compute (no wrap)
+                            emit_select_d2_vselect_g8(cur_idx)
+                            emit_compute_iter_g8(it, wrap=False)
+                        else:
+                            # Fallback (should not happen for bc rounds)
+                            emit_compute_iter_g8(it, wrap=False)
+                    # If next iteration needs scattered loads (d0/d2 case)
+                    if not did_transition and not is_very_last and not next_bc and next_it == 0:
                         # Transitioning from broadcast to scattered round (d0 case)
                         next_idx, _ = get_groups(next_it)
                         emit_node_addr_calc_g8(next_idx, next_node_addrs)

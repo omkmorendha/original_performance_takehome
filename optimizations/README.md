@@ -25,6 +25,7 @@ Each optimization iteration has:
 | 009 | Micro-optimizations (init overlap + store prep) | 2097 | 70.5x | ✓ Tier 2 |
 | 010 | Skip index loads + no-wrap broadcast (d0/d1) | 2053 | 72.0x | ✓ Tier 2 |
 | 011 | Depth-0 zero-index update | 2037 | 72.5x | ✓ Tier 2 |
+| 012 | Depth-2 vselect broadcast (experiment) | 2243 | 65.9x | ✗ Failed |
 
 ## Target Metrics
 
