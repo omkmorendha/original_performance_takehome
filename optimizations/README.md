@@ -23,12 +23,15 @@ Each optimization iteration has:
 | 007 | G=8 scratch-resident + multiply_add + broadcast d0-d1 | 2321 | 63.7x | ✓ Tier 1 |
 | 008 | Deep broadcast interleave + init/store overlap | 2101 | 70.3x | ✓ Tier 2 |
 | 009 | Micro-optimizations (init overlap + store prep) | 2097 | 70.5x | ✓ Tier 2 |
+| 010 | Skip index loads + no-wrap broadcast (d0/d1) | 2053 | 72.0x | ✓ Tier 2 |
+| 011 | Depth-0 zero-index update | 2037 | 72.5x | ✓ Tier 2 |
+| 012 | Depth-2 vselect broadcast (experiment) | 2243 | 65.9x | ✗ Failed |
 
 ## Target Metrics
 
 - **Baseline:** 147734 cycles
 - **Target:** < 1487 cycles (Claude Opus 4.5 benchmark)
-- **Current Best:** 2097 cycles (70.5x speedup, Tier 2)
+- **Current Best:** 2037 cycles (72.5x speedup, Tier 2)
 
 ## Optimization Strategy
 
