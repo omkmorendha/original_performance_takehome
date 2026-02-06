@@ -18,12 +18,15 @@ Each optimization iteration has:
 | 002 | Software pipelining (overlap loads with compute) | 6173 | 23.9x | ✓ Tier 1 |
 | 003 | Eliminate vselect with math (idx = 2*idx+1+val&1) | 5661 | 26.1x | ✓ Tier 1 |
 | 004 | Eliminate wrap vselect + 4-group + round fusion | 3940 | 37.5x | ✓ Tier 1 |
+| 005 | Store overlap + init batching | 3664 | 40.3x | ✓ Tier 1 |
+| 006 | Depth-aware broadcast plan | N/A | N/A | 📋 Plan |
+| 007 | G=8 scratch-resident + multiply_add + broadcast d0-d1 | 2321 | 63.7x | ✓ Tier 1 |
 
 ## Target Metrics
 
 - **Baseline:** 147734 cycles
 - **Target:** < 1487 cycles (Claude Opus 4.5 benchmark)
-- **Current Best:** 3940 cycles (37.5x speedup)
+- **Current Best:** 2321 cycles (63.7x speedup)
 
 ## Optimization Strategy
 
