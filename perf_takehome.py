@@ -129,6 +129,10 @@ class KernelBuilder:
 
         tmp_addrs = [tmp1, tmp2] + [self.alloc_scratch(f"tmp_addr_{i}") for i in range(5)]
 
+        # Store address scratch (for overlapping store prep with last compute)
+        store_addr1 = self.alloc_scratch("store_a1")
+        store_addr2 = self.alloc_scratch("store_a2")
+
         # Scratch-resident: all idx and val live in scratch
         n_groups = batch_size // VLEN  # 32 groups of 8
         all_idx = [self.alloc_scratch(f"sidx_{g}", VLEN) for g in range(n_groups)]
@@ -174,24 +178,37 @@ class KernelBuilder:
 
         self.init_hash_vconsts()
 
-        # Emit all vbroadcasts
+        # Emit all vbroadcasts (overlap with offset constant creation)
         all_vbc = [("vbroadcast", va, sa) for va, sa in self.vconst_inits]
         all_vbc.append(("vbroadcast", v_n_nodes, self.scratch["n_nodes"]))
-        for i in range(0, len(all_vbc), 6):
-            self.instrs.append({"valu": all_vbc[i:i+6]})
 
-        # --- Pre-create offset constants in batches of 2 ---
+        # Pre-calculate which offset constants we'll need
         offset_vals = sorted(set(g * VLEN for g in range(n_groups + 1)))
-        # Ensure all offset constants exist (batched creation)
-        new_consts = [(v, self.alloc_scratch(f"off_{v}")) for v in offset_vals if v not in self.const_map]
-        for i in range(0, len(new_consts), 2):
-            ops = [("const", new_consts[i][1], new_consts[i][0])]
-            if i + 1 < len(new_consts):
-                ops.append(("const", new_consts[i+1][1], new_consts[i+1][0]))
-            self.instrs.append({"load": ops})
-            self.const_map[new_consts[i][0]] = new_consts[i][1]
-            if i + 1 < len(new_consts):
-                self.const_map[new_consts[i+1][0]] = new_consts[i+1][1]
+        # Remove constants we already have (0, 1, 2 will be in const_map after scalar constants)
+        new_offset_consts = [(v, self.alloc_scratch(f"off_{v}")) for v in offset_vals if v > 2]
+
+        # Interleave vbroadcast (VALU) with offset constant creation (LOAD)
+        vbc_idx = 0
+        const_idx = 0
+        while vbc_idx < len(all_vbc) or const_idx < len(new_offset_consts):
+            instr = {}
+            # Add up to 6 vbroadcasts
+            if vbc_idx < len(all_vbc):
+                vbc_batch = all_vbc[vbc_idx:min(vbc_idx + 6, len(all_vbc))]
+                instr["valu"] = vbc_batch
+                vbc_idx += len(vbc_batch)
+            # Add up to 2 const loads
+            if const_idx < len(new_offset_consts):
+                const_batch = []
+                for _ in range(min(2, len(new_offset_consts) - const_idx)):
+                    v, scratch_loc = new_offset_consts[const_idx]
+                    const_batch.append(("const", scratch_loc, v))
+                    self.const_map[v] = scratch_loc
+                    const_idx += 1
+                instr["load"] = const_batch
+            self.instrs.append(instr)
+
+        # Offset constants now created during vbroadcast overlap above
 
         # --- Initial load: all idx and val from memory into scratch (interleaved) ---
         # Build list of all load operations
@@ -696,9 +713,10 @@ class KernelBuilder:
                 if ld:
                     self.instrs.append({"load": ld})
 
-        def emit_compute_iter_g8(it):
+        def emit_compute_iter_g8(it, prep_store=False):
             """Interleaved compute for G=8: 24 VALU cycles.
-            Uses same schedule as pipelined version but without extra loads/ALU."""
+            Uses same schedule as pipelined version but without extra loads/ALU.
+            If prep_store=True, uses idle ALU cycles to pre-compute first store addresses."""
             V, _ = get_groups(it)  # Wait, get_groups returns (idx, val)
             cur_idx, cur_val = get_groups(it)
             V = cur_val
@@ -722,8 +740,17 @@ class KernelBuilder:
             vc3_5 = self.hash_vconsts[(5, 3)]
             T1, T2 = v_tmp1, v_tmp2
 
-            # Cy1: XOR g0-5
-            self.instrs.append({"valu": [("^", V[g], V[g], v_node[g]) for g in range(6)]})
+            # Cy1: XOR g0-5 (+ store prep if requested)
+            instr1 = {"valu": [("^", V[g], V[g], v_node[g]) for g in range(6)]}
+            if prep_store:
+                # Pre-compute first store address pair (values group 0, 1)
+                off1_0 = self.scratch_const(0 * VLEN)
+                off2_0 = self.scratch_const(1 * VLEN)
+                instr1["alu"] = [
+                    ("+", store_addr1, self.scratch["inp_values_p"], off1_0),
+                    ("+", store_addr2, self.scratch["inp_values_p"], off2_0),
+                ]
+            self.instrs.append(instr1)
             # Cy2: XOR g6-7 + H0 madd g0-3
             self.instrs.append({"valu": [
                 ("^", V[6], V[6], v_node[6]), ("^", V[7], V[7], v_node[7]),
@@ -1674,13 +1701,13 @@ class KernelBuilder:
                     emit_node_addr_calc_g8(cur_idx, node_addrs)
                     emit_scattered_loads_g8(node_addrs, v_node)
                     if is_very_last or (next_bc and next_it == 0):
-                        emit_compute_iter_g8(it)
+                        emit_compute_iter_g8(it, prep_store=is_very_last)
                     else:
                         # Pipeline compute with loading next iteration
                         next_idx, _ = get_groups(next_it)
                         emit_pipelined_iter_g8(it, next_idx)
                 elif is_very_last:
-                    emit_compute_iter_g8(it)
+                    emit_compute_iter_g8(it, prep_store=True)
                 else:
                     # Pipelined scattered iteration
                     next_idx, _ = get_groups(next_it)
@@ -1706,16 +1733,23 @@ class KernelBuilder:
         for g in range(0, n_groups, 2):
             store_ops.append(("inp_indices_p", g, all_idx[g], all_idx[g + 1]))
 
-        # First: ALU for pair 0
-        ptr0, g0, d0a, d0b = store_ops[0]
-        off1_0 = self.scratch_const(g0 * VLEN)
-        off2_0 = self.scratch_const((g0 + 1) * VLEN)
-        self.instrs.append({"alu": [
-            ("+", tmp1, self.scratch[ptr0], off1_0),
-            ("+", tmp2, self.scratch[ptr0], off2_0),
-        ]})
-        # Interleaved: store pair N + ALU pair N+1
-        for si in range(len(store_ops) - 1):
+        # First store uses pre-computed addresses from last compute iteration
+        # (store_addr1, store_addr2 were computed during prep_store)
+        _, _, d0a, d0b = store_ops[0]
+
+        # Compute next pair addresses
+        ptr1, g1, _, _ = store_ops[1]
+        off1_1 = self.scratch_const(g1 * VLEN)
+        off2_1 = self.scratch_const((g1 + 1) * VLEN)
+        self.instrs.append({
+            "store": [("vstore", store_addr1, d0a), ("vstore", store_addr2, d0b)],
+            "alu": [
+                ("+", tmp1, self.scratch[ptr1], off1_1),
+                ("+", tmp2, self.scratch[ptr1], off2_1),
+            ],
+        })
+        # Interleaved: store pair N + ALU pair N+1 (starting from pair 1)
+        for si in range(1, len(store_ops) - 1):
             _, _, da, db = store_ops[si]
             ptr_next, g_next, _, _ = store_ops[si + 1]
             off1_n = self.scratch_const(g_next * VLEN)
