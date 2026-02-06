@@ -924,10 +924,11 @@ class KernelBuilder:
                 ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
             ]})
 
-        def emit_compute_iter_d0_g8(it, wrap=True):
+        def emit_compute_iter_d0_g8(it, wrap=True, idx_zero=False):
             """Compute for depth-0 rounds: XOR directly with v_tree[0], skip vbroadcast.
             Saves 2 cycles per d0 iteration by not needing emit_broadcast_tree_value.
-            If wrap=False, skip the idx wrap check (valid for depths < forest_height)."""
+            If wrap=False, skip the idx wrap check (valid for depths < forest_height).
+            If idx_zero=True, assume idx is 0 and use a cheaper update."""
             cur_idx, cur_val = get_groups(it)
             V = cur_val
             I = cur_idx
@@ -1046,46 +1047,64 @@ class KernelBuilder:
                 (op2_5, V[2], T1[2], T2[2]), (op2_5, V[3], T1[3], T2[3]),
                 (op2_5, V[4], T1[4], T2[4]), (op2_5, V[5], T1[5], T2[5]),
             ]})
-            self.instrs.append({"valu": [
-                (op2_5, V[6], T1[6], T2[6]), (op2_5, V[7], T1[7], T2[7]),
-                ("multiply_add", T2[0], I[0], v_two, v_one), ("&", T1[0], V[0], v_one),
-                ("multiply_add", T2[1], I[1], v_two, v_one), ("&", T1[1], V[1], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("multiply_add", T2[2], I[2], v_two, v_one), ("&", T1[2], V[2], v_one),
-                ("multiply_add", T2[3], I[3], v_two, v_one), ("&", T1[3], V[3], v_one),
-                ("multiply_add", T2[4], I[4], v_two, v_one), ("&", T1[4], V[4], v_one),
-            ]})
-            self.instrs.append({"valu": [
-                ("multiply_add", T2[5], I[5], v_two, v_one), ("&", T1[5], V[5], v_one),
-                ("multiply_add", T2[6], I[6], v_two, v_one), ("&", T1[6], V[6], v_one),
-                ("+", I[0], T2[0], T1[0]), ("+", I[1], T2[1], T1[1]),
-            ]})
-            self.instrs.append({"valu": [
-                ("multiply_add", T2[7], I[7], v_two, v_one), ("&", T1[7], V[7], v_one),
-                ("+", I[2], T2[2], T1[2]), ("+", I[3], T2[3], T1[3]),
-                ("+", I[4], T2[4], T1[4]), ("+", I[5], T2[5], T1[5]),
-            ]})
-            if wrap:
+            if idx_zero:
+                # idx is known 0: new_idx = 1 + (val & 1)
                 self.instrs.append({"valu": [
-                    ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
-                    ("<", T1[0], I[0], v_n_nodes), ("<", T1[1], I[1], v_n_nodes),
-                    ("<", T1[2], I[2], v_n_nodes), ("<", T1[3], I[3], v_n_nodes),
+                    (op2_5, V[6], T1[6], T2[6]), (op2_5, V[7], T1[7], T2[7]),
+                    ("&", T1[0], V[0], v_one), ("&", T1[1], V[1], v_one),
+                    ("&", T1[2], V[2], v_one), ("&", T1[3], V[3], v_one),
                 ]})
                 self.instrs.append({"valu": [
-                    ("<", T1[4], I[4], v_n_nodes), ("<", T1[5], I[5], v_n_nodes),
-                    ("<", T1[6], I[6], v_n_nodes), ("<", T1[7], I[7], v_n_nodes),
-                    ("*", I[0], I[0], T1[0]), ("*", I[1], I[1], T1[1]),
+                    ("&", T1[4], V[4], v_one), ("&", T1[5], V[5], v_one),
+                    ("&", T1[6], V[6], v_one), ("&", T1[7], V[7], v_one),
+                    ("+", I[0], T1[0], v_one), ("+", I[1], T1[1], v_one),
                 ]})
                 self.instrs.append({"valu": [
-                    ("*", I[2], I[2], T1[2]), ("*", I[3], I[3], T1[3]),
-                    ("*", I[4], I[4], T1[4]), ("*", I[5], I[5], T1[5]),
-                    ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
+                    ("+", I[2], T1[2], v_one), ("+", I[3], T1[3], v_one),
+                    ("+", I[4], T1[4], v_one), ("+", I[5], T1[5], v_one),
+                    ("+", I[6], T1[6], v_one), ("+", I[7], T1[7], v_one),
                 ]})
             else:
                 self.instrs.append({"valu": [
-                    ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
+                    (op2_5, V[6], T1[6], T2[6]), (op2_5, V[7], T1[7], T2[7]),
+                    ("multiply_add", T2[0], I[0], v_two, v_one), ("&", T1[0], V[0], v_one),
+                    ("multiply_add", T2[1], I[1], v_two, v_one), ("&", T1[1], V[1], v_one),
                 ]})
+                self.instrs.append({"valu": [
+                    ("multiply_add", T2[2], I[2], v_two, v_one), ("&", T1[2], V[2], v_one),
+                    ("multiply_add", T2[3], I[3], v_two, v_one), ("&", T1[3], V[3], v_one),
+                    ("multiply_add", T2[4], I[4], v_two, v_one), ("&", T1[4], V[4], v_one),
+                ]})
+                self.instrs.append({"valu": [
+                    ("multiply_add", T2[5], I[5], v_two, v_one), ("&", T1[5], V[5], v_one),
+                    ("multiply_add", T2[6], I[6], v_two, v_one), ("&", T1[6], V[6], v_one),
+                    ("+", I[0], T2[0], T1[0]), ("+", I[1], T2[1], T1[1]),
+                ]})
+                self.instrs.append({"valu": [
+                    ("multiply_add", T2[7], I[7], v_two, v_one), ("&", T1[7], V[7], v_one),
+                    ("+", I[2], T2[2], T1[2]), ("+", I[3], T2[3], T1[3]),
+                    ("+", I[4], T2[4], T1[4]), ("+", I[5], T2[5], T1[5]),
+                ]})
+                if wrap:
+                    self.instrs.append({"valu": [
+                        ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
+                        ("<", T1[0], I[0], v_n_nodes), ("<", T1[1], I[1], v_n_nodes),
+                        ("<", T1[2], I[2], v_n_nodes), ("<", T1[3], I[3], v_n_nodes),
+                    ]})
+                    self.instrs.append({"valu": [
+                        ("<", T1[4], I[4], v_n_nodes), ("<", T1[5], I[5], v_n_nodes),
+                        ("<", T1[6], I[6], v_n_nodes), ("<", T1[7], I[7], v_n_nodes),
+                        ("*", I[0], I[0], T1[0]), ("*", I[1], I[1], T1[1]),
+                    ]})
+                    self.instrs.append({"valu": [
+                        ("*", I[2], I[2], T1[2]), ("*", I[3], I[3], T1[3]),
+                        ("*", I[4], I[4], T1[4]), ("*", I[5], I[5], T1[5]),
+                        ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
+                    ]})
+                else:
+                    self.instrs.append({"valu": [
+                        ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
+                    ]})
 
         def emit_compute_iter_d1_g8(it, wrap=True):
             """Fused d1 selection + compute: saves 1 cycle vs separate calls.
@@ -1717,7 +1736,7 @@ class KernelBuilder:
                                         and not next_bc and next_it == 0)
                     if depth == 0:
                         # d0: XOR directly with v_tree[0], skip vbroadcast + wrap
-                        emit_compute_iter_d0_g8(it, wrap=False)
+                        emit_compute_iter_d0_g8(it, wrap=False, idx_zero=True)
                     elif is_d1_transition:
                         # d1 transition: fused selection + compute + addr calc + loads
                         next_idx, _ = get_groups(next_it)
