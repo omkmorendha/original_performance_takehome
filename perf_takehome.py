@@ -210,40 +210,62 @@ class KernelBuilder:
 
         # Offset constants now created during vbroadcast overlap above
 
-        # --- Initial load: all idx and val from memory into scratch (interleaved) ---
-        # Build list of all load operations
+        # --- Initial load: values only (indices are known zero) ---
+        # Build list of all value load operations
         init_loads = []
-        for g in range(0, n_groups, 2):
-            init_loads.append(("inp_indices_p", g, all_idx[g], all_idx[g + 1]))
         for g in range(0, n_groups, 2):
             init_loads.append(("inp_values_p", g, all_val[g], all_val[g + 1]))
 
-        # First: ALU for pair 0
+        idx_init_ops = [("vbroadcast", all_idx[g], zero_const) for g in range(n_groups)]
+
+        def take_idx_inits(max_ops=6):
+            nonlocal idx_init_ops
+            if not idx_init_ops:
+                return []
+            ops = idx_init_ops[:max_ops]
+            idx_init_ops = idx_init_ops[max_ops:]
+            return ops
+
+        # First: ALU for pair 0 (+ idx init)
         ptr0, g0, _, _ = init_loads[0]
         off1_0 = self.const_map[g0 * VLEN]
         off2_0 = self.const_map[(g0 + 1) * VLEN]
-        self.instrs.append({"alu": [
+        instr0 = {"alu": [
             ("+", tmp1, self.scratch[ptr0], off1_0),
             ("+", tmp2, self.scratch[ptr0], off2_0),
-        ]})
-        # Interleaved: load pair N + ALU pair N+1
+        ]}
+        vb = take_idx_inits(6)
+        if vb:
+            instr0["valu"] = vb
+        self.instrs.append(instr0)
+
+        # Interleaved: load pair N + ALU pair N+1 (+ idx init)
         for si in range(len(init_loads) - 1):
             _, _, da, db = init_loads[si]
             ptr_next, g_next, _, _ = init_loads[si + 1]
             off1_n = self.const_map[g_next * VLEN]
             off2_n = self.const_map[(g_next + 1) * VLEN]
-            self.instrs.append({
+            instr = {
                 "load": [("vload", da, tmp1), ("vload", db, tmp2)],
                 "alu": [
                     ("+", tmp1, self.scratch[ptr_next], off1_n),
                     ("+", tmp2, self.scratch[ptr_next], off2_n),
                 ],
-            })
-        # Last: load final pair
+            }
+            vb = take_idx_inits(6)
+            if vb:
+                instr["valu"] = vb
+            self.instrs.append(instr)
+
+        # Last: load final pair (+ idx init)
         _, _, da_last, db_last = init_loads[-1]
-        self.instrs.append({"load": [
+        instr_last = {"load": [
             ("vload", da_last, tmp1), ("vload", db_last, tmp2),
-        ]})
+        ]}
+        vb = take_idx_inits(6)
+        if vb:
+            instr_last["valu"] = vb
+        self.instrs.append(instr_last)
 
         self.add("flow", ("pause",))
 
@@ -902,9 +924,10 @@ class KernelBuilder:
                 ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
             ]})
 
-        def emit_compute_iter_d0_g8(it):
+        def emit_compute_iter_d0_g8(it, wrap=True):
             """Compute for depth-0 rounds: XOR directly with v_tree[0], skip vbroadcast.
-            Saves 2 cycles per d0 iteration by not needing emit_broadcast_tree_value."""
+            Saves 2 cycles per d0 iteration by not needing emit_broadcast_tree_value.
+            If wrap=False, skip the idx wrap check (valid for depths < forest_height)."""
             cur_idx, cur_val = get_groups(it)
             V = cur_val
             I = cur_idx
@@ -1043,26 +1066,32 @@ class KernelBuilder:
                 ("+", I[2], T2[2], T1[2]), ("+", I[3], T2[3], T1[3]),
                 ("+", I[4], T2[4], T1[4]), ("+", I[5], T2[5], T1[5]),
             ]})
-            self.instrs.append({"valu": [
-                ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
-                ("<", T1[0], I[0], v_n_nodes), ("<", T1[1], I[1], v_n_nodes),
-                ("<", T1[2], I[2], v_n_nodes), ("<", T1[3], I[3], v_n_nodes),
-            ]})
-            self.instrs.append({"valu": [
-                ("<", T1[4], I[4], v_n_nodes), ("<", T1[5], I[5], v_n_nodes),
-                ("<", T1[6], I[6], v_n_nodes), ("<", T1[7], I[7], v_n_nodes),
-                ("*", I[0], I[0], T1[0]), ("*", I[1], I[1], T1[1]),
-            ]})
-            self.instrs.append({"valu": [
-                ("*", I[2], I[2], T1[2]), ("*", I[3], I[3], T1[3]),
-                ("*", I[4], I[4], T1[4]), ("*", I[5], I[5], T1[5]),
-                ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
-            ]})
+            if wrap:
+                self.instrs.append({"valu": [
+                    ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
+                    ("<", T1[0], I[0], v_n_nodes), ("<", T1[1], I[1], v_n_nodes),
+                    ("<", T1[2], I[2], v_n_nodes), ("<", T1[3], I[3], v_n_nodes),
+                ]})
+                self.instrs.append({"valu": [
+                    ("<", T1[4], I[4], v_n_nodes), ("<", T1[5], I[5], v_n_nodes),
+                    ("<", T1[6], I[6], v_n_nodes), ("<", T1[7], I[7], v_n_nodes),
+                    ("*", I[0], I[0], T1[0]), ("*", I[1], I[1], T1[1]),
+                ]})
+                self.instrs.append({"valu": [
+                    ("*", I[2], I[2], T1[2]), ("*", I[3], I[3], T1[3]),
+                    ("*", I[4], I[4], T1[4]), ("*", I[5], I[5], T1[5]),
+                    ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
+                ]})
+            else:
+                self.instrs.append({"valu": [
+                    ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
+                ]})
 
-        def emit_compute_iter_d1_g8(it):
+        def emit_compute_iter_d1_g8(it, wrap=True):
             """Fused d1 selection + compute: saves 1 cycle vs separate calls.
             Total: 27 cycles (vs 4+24=28 for separate emit_broadcast + emit_compute).
-            Overlaps the tail of d1 mask+madd selection with the start of XOR+hash."""
+            Overlaps the tail of d1 mask+madd selection with the start of XOR+hash.
+            If wrap=False, skip the idx wrap check (valid for depths < forest_height)."""
             cur_idx, cur_val = get_groups(it)
             V = cur_val
             I = cur_idx
@@ -1245,24 +1274,30 @@ class KernelBuilder:
                 ("+", I[2], T2[2], T1[2]), ("+", I[3], T2[3], T1[3]),
                 ("+", I[4], T2[4], T1[4]), ("+", I[5], T2[5], T1[5]),
             ]})
-            # Cy25: + g6-7, < g0-3
-            self.instrs.append({"valu": [
-                ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
-                ("<", T1[0], I[0], v_n_nodes), ("<", T1[1], I[1], v_n_nodes),
-                ("<", T1[2], I[2], v_n_nodes), ("<", T1[3], I[3], v_n_nodes),
-            ]})
-            # Cy26: < g4-7, wrap g0-1
-            self.instrs.append({"valu": [
-                ("<", T1[4], I[4], v_n_nodes), ("<", T1[5], I[5], v_n_nodes),
-                ("<", T1[6], I[6], v_n_nodes), ("<", T1[7], I[7], v_n_nodes),
-                ("*", I[0], I[0], T1[0]), ("*", I[1], I[1], T1[1]),
-            ]})
-            # Cy27: wrap g2-7
-            self.instrs.append({"valu": [
-                ("*", I[2], I[2], T1[2]), ("*", I[3], I[3], T1[3]),
-                ("*", I[4], I[4], T1[4]), ("*", I[5], I[5], T1[5]),
-                ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
-            ]})
+            if wrap:
+                # Cy25: + g6-7, < g0-3
+                self.instrs.append({"valu": [
+                    ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
+                    ("<", T1[0], I[0], v_n_nodes), ("<", T1[1], I[1], v_n_nodes),
+                    ("<", T1[2], I[2], v_n_nodes), ("<", T1[3], I[3], v_n_nodes),
+                ]})
+                # Cy26: < g4-7, wrap g0-1
+                self.instrs.append({"valu": [
+                    ("<", T1[4], I[4], v_n_nodes), ("<", T1[5], I[5], v_n_nodes),
+                    ("<", T1[6], I[6], v_n_nodes), ("<", T1[7], I[7], v_n_nodes),
+                    ("*", I[0], I[0], T1[0]), ("*", I[1], I[1], T1[1]),
+                ]})
+                # Cy27: wrap g2-7
+                self.instrs.append({"valu": [
+                    ("*", I[2], I[2], T1[2]), ("*", I[3], I[3], T1[3]),
+                    ("*", I[4], I[4], T1[4]), ("*", I[5], I[5], T1[5]),
+                    ("*", I[6], I[6], T1[6]), ("*", I[7], I[7], T1[7]),
+                ]})
+            else:
+                # Cy25: + g6-7 only (no wrap needed)
+                self.instrs.append({"valu": [
+                    ("+", I[6], T2[6], T1[6]), ("+", I[7], T2[7], T1[7]),
+                ]})
 
         def emit_compute_iter_d1_pipelined_g8(it, next_it_idx_addrs):
             """Fused d1 selection + compute + addr calc + scattered loads for next round.
@@ -1681,15 +1716,15 @@ class KernelBuilder:
                     is_d1_transition = (depth == 1 and not is_very_last
                                         and not next_bc and next_it == 0)
                     if depth == 0:
-                        # d0: XOR directly with v_tree[0], skip vbroadcast
-                        emit_compute_iter_d0_g8(it)
+                        # d0: XOR directly with v_tree[0], skip vbroadcast + wrap
+                        emit_compute_iter_d0_g8(it, wrap=False)
                     elif is_d1_transition:
                         # d1 transition: fused selection + compute + addr calc + loads
                         next_idx, _ = get_groups(next_it)
                         emit_compute_iter_d1_pipelined_g8(it, next_idx)
                     else:
-                        # d1: fused selection + compute (no transition)
-                        emit_compute_iter_d1_g8(it)
+                        # d1: fused selection + compute (no transition, no wrap)
+                        emit_compute_iter_d1_g8(it, wrap=False)
                     # If next iteration needs scattered loads (d0 case only now)
                     if not is_d1_transition and not is_very_last and not next_bc and next_it == 0:
                         # Transitioning from broadcast to scattered round (d0 case)
