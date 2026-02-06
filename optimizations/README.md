@@ -21,12 +21,13 @@ Each optimization iteration has:
 | 005 | Store overlap + init batching | 3664 | 40.3x | ✓ Tier 1 |
 | 006 | Depth-aware broadcast plan | N/A | N/A | 📋 Plan |
 | 007 | G=8 scratch-resident + multiply_add + broadcast d0-d1 | 2321 | 63.7x | ✓ Tier 1 |
+| 008 | Deep broadcast interleave + init/store overlap | 2101 | 70.3x | ✓ Tier 2 |
 
 ## Target Metrics
 
 - **Baseline:** 147734 cycles
 - **Target:** < 1487 cycles (Claude Opus 4.5 benchmark)
-- **Current Best:** 2321 cycles (63.7x speedup)
+- **Current Best:** 2101 cycles (70.3x speedup)
 
 ## Optimization Strategy
 
